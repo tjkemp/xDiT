@@ -16,7 +16,9 @@ from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sp_group,
     get_runtime_state,
+    get_ulysses_parallel_world_size,
 )
+from xfuser.core.distributed.attention_backend import AttentionBackendType
 from xfuser.model_executor.layers.attention_processor import (
     xFuserAttentionProcessorRegister
 )
@@ -84,7 +86,6 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             image_context_length = encoder_hidden_states.shape[1] - 512
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
-
         query, key, value = self._get_qkv_projections(attn, hidden_states, encoder_hidden_states)
 
         query = attn.norm_q(query)
@@ -125,8 +126,12 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
 
-
-        hidden_states = self.attention_function(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), backend=backend).transpose(1, 2)
+        use_fp8_a2a = (
+            not self.is_cross_attention
+            and get_runtime_state().attention_backend == AttentionBackendType.AITER_FP8
+            and get_ulysses_parallel_world_size() > 1
+        )
+        hidden_states = self.attention_function(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), backend=backend, use_fp8_a2a=use_fp8_a2a).transpose(1, 2)
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
