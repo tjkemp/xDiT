@@ -122,6 +122,12 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             query = apply_rotary_emb(query, *rotary_emb)
             key = apply_rotary_emb(key, *rotary_emb)
 
+        use_fp8_a2a = (
+            not self.is_cross_attention
+            and get_runtime_state().attention_backend == AttentionBackendType.AITER_FP8
+            and get_ulysses_parallel_world_size() > 1
+        )
+
         # I2V task
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
@@ -136,20 +142,16 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                                                         value_img.transpose(1, 2),
                                                         backend=backend,
                                                         attention_kwargs=self.attention_kwargs,
-                                                        ).transpose(1, 2)
+                                                        use_fp8_a2a=use_fp8_a2a).transpose(1, 2)
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
 
-        use_fp8_a2a = (
-            not self.is_cross_attention
-            and get_runtime_state().attention_backend == AttentionBackendType.AITER_FP8
-            and get_ulysses_parallel_world_size() > 1
-        )
         hidden_states = self.attention_function(
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
-            backend=backend, use_fp8_a2a=use_fp8_a2a,
+            backend=backend,
+            use_fp8_a2a=use_fp8_a2a,
             attention_kwargs=self.attention_kwargs,
         ).transpose(1, 2)
 
