@@ -27,6 +27,12 @@ from packaging.version import parse
 from xfuser.core.cache_manager.cache_manager import get_cache_manager
 from xfuser.core.distributed.attention_backend import ATTENTION_FUNCTION_REGISTRY
 
+_FP8_STATIC_SCALE = None
+try:
+    _FP8_STATIC_SCALE = float(os.environ["XFUSER_AITER_FP8_STATIC_SCALE_WITH_DESCALE"])
+except (KeyError, ValueError):
+    pass
+
 
 def ring_attn(attention_function, query, key, value, dropout_p=0.0, is_causal=False, joint_attn_kwargs=None, attention_kwargs=None):
     kwargs = {
@@ -96,12 +102,17 @@ def _ft_c_input_all_to_all(x):
 def _per_tensor_quant(x: torch.Tensor):
     """Quantize to FP8 with a global scale all-reduced across the Ulysses group.
 
+    If XFUSER_AITER_FP8_STATIC_SCALE_WITH_DESCALE is set, uses that as a fixed
+    scale and skips the all_reduce. Otherwise computes scale dynamically.
     Returns (x_fp8, scale) where scale is a scalar float32 tensor.
     """
     dtype_max = torch.finfo(torch.float8_e4m3fn).max
-    amax = x.float().abs().amax()
-    dist.all_reduce(amax, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
-    scale = amax / dtype_max
+    if _FP8_STATIC_SCALE is not None:
+        scale = torch.tensor(_FP8_STATIC_SCALE, dtype=torch.float32, device=x.device)
+    else:
+        amax = x.float().abs().amax()
+        dist.all_reduce(scale, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
+        scale = amax / dtype_max
     x_fp8 = (x.float() / scale).to(torch.float8_e4m3fn)
     return x_fp8, scale
 
