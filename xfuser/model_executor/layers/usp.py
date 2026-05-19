@@ -92,45 +92,18 @@ def _ft_c_input_all_to_all(x):
     return x
 
 
-def _per_head_quant(x: torch.Tensor):
-    """Quantize x to FP8 per head, with global max all-reduced across the Ulysses group.
+def _per_tensor_quant(x: torch.Tensor):
+    """Quantize to FP8 with a global scale all-reduced across the Ulysses group.
 
-    Input shape: [B, H, S/P, D] BF16
-    Returns: (x_fp8 [B, H, S/P, D], scale [B, H] float32)
+    Returns (x_fp8, scale) where scale is a scalar float32 tensor.
     """
     dtype_max = torch.finfo(torch.float8_e4m3fn).max
-    amax = x.float().abs().amax(dim=(-2, -1))  # [B, H]
+    amax = x.float().abs().amax()
     dist.all_reduce(amax, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
-    scale = amax / dtype_max  # [B, H]
-    x_fp8 = (x.float() / scale[..., None, None]).to(torch.float8_e4m3fn)
+    scale = amax / dtype_max
+    x_fp8 = (x.float() / scale).to(torch.float8_e4m3fn)
     return x_fp8, scale
 
-
-def _fp8_input_all_to_all(x_fp8: torch.Tensor, scale: torch.Tensor):
-    """All2all an FP8 tensor and its per-head scale across the Ulysses group.
-
-    Input:  x_fp8 [B, H, S/P, D],  scale [B, H]
-    Output: x_fp8 [B, H/P, S, D],  scale [B, H/P]
-    """
-    world_size = get_ulysses_parallel_world_size()
-    b, h, s, d = x_fp8.shape
-    assert h % world_size == 0
-
-    # All2all the FP8 tensor: same permute as _ft_c_input_all_to_all
-    x = x_fp8.permute(1, 0, 2, 3).contiguous()
-    x = _sdpa_all_to_all_single(x)
-    x = x.reshape(world_size, h // world_size, b, -1, d).permute(2, 1, 0, 3, 4).reshape(b, h // world_size, -1, d)
-
-    # All2all the scale [B, H] → [B, H/P]
-    s_out = _sdpa_all_to_all_single(scale.permute(1, 0).contiguous())  # [H, B] → all2all
-    s_out = s_out.reshape(world_size, h // world_size, b).permute(2, 1, 0).reshape(b, h // world_size, world_size)
-    # Each rank contributed one scale per head shard; take the one that matches the received shard.
-    # After all2all on [H, B], rank r gets scales from heads [r*H/P:(r+1)*H/P] of all other ranks.
-    # Since all ranks used the same global max (all-reduced in _per_head_quant), all P values are
-    # identical — just take the first.
-    s_out = s_out[..., 0]  # [B, H/P]
-
-    return x, s_out
 
 
 def _combined_qkv_all_to_all(q, k, v):
@@ -310,17 +283,17 @@ def USP(
 
     if get_ulysses_parallel_world_size() > 1:
         if use_fp8_a2a:
-            q_fp8, q_scale = _per_head_quant(query)
-            k_fp8, k_scale = _per_head_quant(key)
-            v_fp8, v_scale = _per_head_quant(value)
-            query, q_scale = _fp8_input_all_to_all(q_fp8, q_scale)
-            key,   k_scale = _fp8_input_all_to_all(k_fp8, k_scale)
-            value, v_scale = _fp8_input_all_to_all(v_fp8, v_scale)
+            q_fp8, q_scale = _per_tensor_quant(query)
+            k_fp8, k_scale = _per_tensor_quant(key)
+            v_fp8, v_scale = _per_tensor_quant(value)
+            query = _ft_c_input_all_to_all(q_fp8)
+            key   = _ft_c_input_all_to_all(k_fp8)
+            value = _ft_c_input_all_to_all(v_fp8)
             attention_kwargs = (attention_kwargs or {}) | {
                 "pre_quantized": True,
-                "q_descale": q_scale,
-                "k_descale": k_scale,
-                "v_descale": v_scale,
+                "q_descale": q_scale.reshape(1, 1),
+                "k_descale": k_scale.reshape(1, 1),
+                "v_descale": v_scale.reshape(1, 1),
             }
         elif combine_qkv_a2a and query.shape == key.shape == value.shape:
             query, key, value = _combined_qkv_all_to_all(query, key, value)
