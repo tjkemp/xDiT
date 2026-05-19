@@ -111,7 +111,7 @@ def _per_tensor_quant(x: torch.Tensor):
         scale = torch.tensor(_FP8_STATIC_SCALE, dtype=torch.float32, device=x.device)
     else:
         amax = x.float().abs().amax()
-        dist.all_reduce(scale, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
+        dist.all_reduce(amax, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
         scale = amax / dtype_max
     x_fp8 = (x.float() / scale).to(torch.float8_e4m3fn)
     return x_fp8, scale
