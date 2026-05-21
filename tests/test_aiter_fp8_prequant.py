@@ -11,10 +11,15 @@ If ref ≈ auto but ref ≉ pre, the pre_quantized path has a bug.
 If ref ≉ auto, the FP8 kernel itself is the source of quality loss.
 
 Usage:
-    python tests/test_aiter_fp8_prequant.py
+    python tests/test_aiter_fp8_prequant.py [--compile] [--profile]
+
+Flags:
+  --compile   wrap each attention function with torch.compile before running
+  --profile   emit a Chrome trace to /tmp/aiter_fp8_{auto,pre}.json
 """
 
 import sys
+import argparse
 import torch
 import torch.nn.functional as F
 
@@ -54,7 +59,7 @@ def _quant_per_tensor(x):
     """Mimic _per_tensor_quant from usp.py (without distributed all_reduce)."""
     dtype_max = torch.finfo(torch.float8_e4m3fn).max
     scale = x.float().abs().amax() / dtype_max
-    return (x.float() / scale).to(torch.float8_e4m3fn), scale.reshape(1, 1)
+    return (x.float() / scale).to(torch.float8_e4m3fn), scale.reshape(1)
 
 
 def _aiter_fp8_pre(q, k, v):
@@ -66,6 +71,29 @@ def _aiter_fp8_pre(q, k, v):
         q_fp8, k_fp8, v_fp8,
         q_descale=q_ds, k_descale=k_ds, v_descale=v_ds,
     )
+
+
+def _profile(fn, label, q, k, v, warmup=3, steps=10):
+    """Run fn(q, k, v) under torch.profiler and save a Chrome trace to /tmp."""
+    for _ in range(warmup):
+        fn(q, k, v)
+    torch.cuda.synchronize()
+
+    trace_path = f"/tmp/aiter_fp8_{label}.json"
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        record_shapes=False,
+    ) as prof:
+        for _ in range(steps):
+            fn(q, k, v)
+        torch.cuda.synchronize()
+
+    prof.export_chrome_trace(trace_path)
+    print(f"  [{label}] Chrome trace -> {trace_path}")
+
+    # Print top CUDA kernels by total time
+    table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=20)
+    print(table)
 
 
 def _compare(label, a, b, device):
@@ -98,7 +126,7 @@ def test_pipeline_dtypes(B, H, S, D, device):
     dtype_max = torch.finfo(torch.float8_e4m3fn).max
     scale = q_bf16.float().abs().amax() / dtype_max
     q_fp8 = (q_bf16.float() / scale).to(torch.float8_e4m3fn)
-    descale = scale.reshape(1, 1)
+    descale = scale.reshape(1)
     print(f"  after quant    dtype={q_fp8.dtype}  shape={tuple(q_fp8.shape)}  scale={scale.item():.5f}")
 
     # Step 2: simulate the permute/reshape from _ft_c_input_all_to_all
@@ -127,12 +155,25 @@ def test_pipeline_dtypes(B, H, S, D, device):
     _compare("pipeline vs BF16 ref", out.float(), out_ref.float(), device)
 
 
+def _inspect_descales(q):
+    """Print descale shapes returned by aiter.per_tensor_quant vs our _quant_per_tensor."""
+    fp8 = aiter.dtypes.fp8
+    dtype_max = torch.finfo(fp8).max
+    _, auto_ds = aiter.per_tensor_quant(q, quant_dtype=fp8, dtypeMax=dtype_max)
+    _, pre_ds  = _quant_per_tensor(q)
+    print(f"  aiter.per_tensor_quant descale: shape={tuple(auto_ds.shape)}  dtype={auto_ds.dtype}  value={auto_ds.flatten()[0].item():.6f}")
+    print(f"  _quant_per_tensor      descale: shape={tuple(pre_ds.shape)}   dtype={pre_ds.dtype}   value={pre_ds.flatten()[0].item():.6f}")
+
+
 def run(B, H, S, D, device):
     print(f"\nshape [B={B}, S={S}, H={H}, D={D}]")
     torch.manual_seed(42)
     q = torch.randn(B, S, H, D, dtype=torch.bfloat16, device=device)
     k = torch.randn(B, S, H, D, dtype=torch.bfloat16, device=device)
     v = torch.randn(B, S, H, D, dtype=torch.bfloat16, device=device)
+
+    print("descale shapes:")
+    _inspect_descales(q)
 
     out_ref  = _sdpa_ref(q, k, v)
     out_auto = _aiter_fp8_auto(q, k, v)
@@ -144,11 +185,23 @@ def run(B, H, S, D, device):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--compile", action="store_true", help="wrap attention functions with torch.compile")
+    parser.add_argument("--profile", action="store_true", help="profile both paths and emit Chrome traces to /tmp/")
+    args = parser.parse_args()
+
     if not torch.cuda.is_available():
         print("SKIP: no CUDA device")
         sys.exit(0)
 
     device = "cuda:0"
+
+    auto_fn = _aiter_fp8_auto
+    pre_fn  = _aiter_fp8_pre
+    if args.compile:
+        print("torch.compile enabled")
+        auto_fn = torch.compile(_aiter_fp8_auto)
+        pre_fn  = torch.compile(_aiter_fp8_pre)
 
     # dtype trace through the full fp8_a2a pipeline
     test_pipeline_dtypes(B=1, H=40, S=512,  D=128, device=device)
@@ -158,3 +211,14 @@ if __name__ == "__main__":
     # inputs in [B, S, H, D] as the kernel expects
     run(B=1, H=40, S=512,  D=128, device=device)
     run(B=1, H=5,  S=4096, D=128, device=device)
+
+    if args.profile:
+        print("\n--- profiling auto path ---")
+        torch.manual_seed(42)
+        q = torch.randn(1, 512, 40, 128, dtype=torch.bfloat16, device=device)
+        k = torch.randn(1, 512, 40, 128, dtype=torch.bfloat16, device=device)
+        v = torch.randn(1, 512, 40, 128, dtype=torch.bfloat16, device=device)
+        _profile(auto_fn, "auto", q, k, v)
+
+        print("\n--- profiling pre path ---")
+        _profile(pre_fn, "pre", q, k, v)
