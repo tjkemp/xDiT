@@ -114,7 +114,7 @@ def _per_tensor_quant(x: torch.Tensor):
         dist.all_reduce(amax, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
         scale = amax / dtype_max
     x_fp8 = (x.float() / scale).to(torch.float8_e4m3fn)
-    return x_fp8, scale
+    return x_fp8, scale.reshape(1)
 
 
 
@@ -305,9 +305,9 @@ def USP(
             value = _ft_c_input_all_to_all(v_fp8)
             attention_kwargs = (attention_kwargs or {}) | {
                 "pre_quantized": True,
-                "q_descale": q_scale.reshape(1, 1),
-                "k_descale": k_scale.reshape(1, 1),
-                "v_descale": v_scale.reshape(1, 1),
+                "q_descale": q_scale.reshape(1),
+                "k_descale": k_scale.reshape(1),
+                "v_descale": v_scale.reshape(1),
             }
         elif combine_qkv_a2a and query.shape == key.shape == value.shape:
             query, key, value = _combined_qkv_all_to_all(query, key, value)
