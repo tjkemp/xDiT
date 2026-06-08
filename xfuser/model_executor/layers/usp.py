@@ -296,13 +296,13 @@ def USP(
     if get_ulysses_parallel_world_size() > 1:
         if use_fp8_a2a:
             q_fp8, q_scale = _per_tensor_quant(query)
+            query = _ft_c_input_all_to_all(q_fp8)
             k_fp8, k_scale = _per_tensor_quant(key)
+            key   = _ft_c_input_all_to_all(k_fp8)
             v_fp8, v_scale = _per_tensor_quant(value)
+            value = _ft_c_input_all_to_all(v_fp8)
             if os.environ.get("XFUSER_FP8_LOG_SCALES") and dist.get_rank() == 0:
                 print(f"[fp8_scales] q={q_scale.item():.4f} k={k_scale.item():.4f} v={v_scale.item():.4f}")
-            query = _ft_c_input_all_to_all(q_fp8)
-            key   = _ft_c_input_all_to_all(k_fp8)
-            value = _ft_c_input_all_to_all(v_fp8)
             attention_kwargs = (attention_kwargs or {}) | {
                 "pre_quantized": True,
                 "q_descale": q_scale.reshape(1),
