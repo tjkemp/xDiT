@@ -10,6 +10,12 @@ from xfuser.core.distributed import get_ulysses_parallel_world_size
 
 ATTENTION_FUNCTION_REGISTRY = {}
 
+try:
+    import aiter as _aiter
+    AITER_FP8_DTYPE = _aiter.dtypes.fp8
+except (ImportError, AttributeError):
+    AITER_FP8_DTYPE = torch.float8_e4m3fn
+
 def _setup_aiter_environment_variables():
     AITER_FP8_STATIC_SCALE_WITH_DESCALE = environment_variables["AITER_FP8_STATIC_SCALE_WITH_DESCALE"]()
     try:
