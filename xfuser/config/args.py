@@ -126,6 +126,7 @@ class xFuserArgs:
     cross_attention_backend: Optional[str] = None
     use_fp8_gemms: bool = False
     use_fp4_gemms: bool = False
+    fp8_a2a_scale: Optional[float] = None
     # Model runner specific
     num_iterations: int = 1
     profile: bool = False
@@ -381,6 +382,12 @@ class xFuserArgs:
             "--use_fp8_gemms",
             action="store_true",
             help="Quantize the transformer linear layers (selected models only).",
+        )
+        runtime_group.add_argument(
+            "--fp8_a2a_scale",
+            type=float,
+            default=None,
+            help="When set, Q/K/V are quantized to FP8 before the all-to-all using this fixed scale. Requires aiter_fp8. Use XFUSER_FP8_LOG_SCALES=1 to measure a suitable value. Good default is 1.0.",
         )
 
         # DiTFastAttn arguments
@@ -775,6 +782,7 @@ class xFuserArgs:
             use_fp8_t5_encoder=self.use_fp8_t5_encoder,
             attention_backend=self.attention_backend,
             cross_attention_backend=self.cross_attention_backend,
+            fp8_a2a_scale=self.fp8_a2a_scale,
         )
 
         parallel_config = ParallelConfig(

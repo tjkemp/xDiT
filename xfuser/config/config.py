@@ -64,6 +64,7 @@ class RuntimeConfig:
     use_fbcache: bool = False
     attention_backend: Optional[str] = None
     cross_attention_backend: Optional[str] = None
+    fp8_a2a_scale: Optional[float] = None
 
     def __post_init__(self):
         check_packages()
