@@ -97,8 +97,10 @@ def _ft_c_input_all_to_all(x):
 
 def _per_tensor_quant(x: torch.Tensor, scale: float) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize x to FP8 using a fixed scale. Returns (x_fp8, descale) where descale is shape (1,)."""
+    import aiter
+    fp8_dtype = aiter.dtypes.fp8
     scale_t = torch.tensor(scale, dtype=torch.float32, device=x.device)
-    x_fp8 = (x.float() / scale_t).to(torch.float8_e4m3fn)
+    x_fp8 = (x.float() / scale_t).to(fp8_dtype)
     return x_fp8, scale_t.reshape(1)
 
 
