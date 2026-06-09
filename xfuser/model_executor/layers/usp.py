@@ -100,8 +100,7 @@ def _per_tensor_quant(x: torch.Tensor, scale: float) -> tuple[torch.Tensor, torc
     import aiter
     fp8_dtype = aiter.dtypes.fp8
     scale_t = torch.tensor(scale, dtype=torch.float32, device=x.device)
-    x_fp8 = (x.float() / scale_t).to(fp8_dtype)
-    return x_fp8, scale_t.reshape(1)
+    return aiter.per_tensor_quant(x, scale=scale_t, quant_dtype=fp8_dtype, dtypeMax=torch.finfo(fp8_dtype).max)
 
 
 
