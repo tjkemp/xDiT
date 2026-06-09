@@ -355,6 +355,7 @@ def attention(
         value: torch.Tensor,
         dropout_p: float = 0.0,
         is_causal: bool = False,
+        use_fp8_a2a: bool = False,  # accepted for call-site uniformity with USP(), never applied
         backend=None,
     ):
     """
