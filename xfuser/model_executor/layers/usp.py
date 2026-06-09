@@ -27,11 +27,7 @@ from packaging.version import parse
 from xfuser.core.cache_manager.cache_manager import get_cache_manager
 from xfuser.core.distributed.attention_backend import ATTENTION_FUNCTION_REGISTRY
 
-_FP8_STATIC_SCALE = None
-try:
-    _FP8_STATIC_SCALE = float(os.environ["XFUSER_AITER_FP8_STATIC_SCALE_WITH_DESCALE"])
-except (KeyError, ValueError):
-    pass
+_FP8_LOG_SCALES = bool(os.environ.get("XFUSER_FP8_LOG_SCALES"))
 
 
 def ring_attn(attention_function, query, key, value, dropout_p=0.0, is_causal=False, joint_attn_kwargs=None, attention_kwargs=None):
@@ -99,22 +95,11 @@ def _ft_c_input_all_to_all(x):
     return x
 
 
-def _per_tensor_quant(x: torch.Tensor):
-    """Quantize to FP8 with a global scale all-reduced across the Ulysses group.
-
-    If XFUSER_AITER_FP8_STATIC_SCALE_WITH_DESCALE is set, uses that as a fixed
-    scale and skips the all_reduce. Otherwise computes scale dynamically.
-    Returns (x_fp8, scale) where scale is a scalar float32 tensor.
-    """
-    dtype_max = torch.finfo(torch.float8_e4m3fn).max
-    if _FP8_STATIC_SCALE is not None:
-        scale = torch.tensor(_FP8_STATIC_SCALE, dtype=torch.float32, device=x.device)
-    else:
-        amax = x.float().abs().amax()
-        dist.all_reduce(amax, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
-        scale = amax / dtype_max
-    x_fp8 = (x.float() / scale).to(torch.float8_e4m3fn)
-    return x_fp8, scale.reshape(1)
+def _per_tensor_quant(x: torch.Tensor, scale: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize x to FP8 using a fixed scale. Returns (x_fp8, descale) where descale is shape (1,)."""
+    scale_t = torch.tensor(scale, dtype=torch.float32, device=x.device)
+    x_fp8 = (x.float() / scale_t).to(torch.float8_e4m3fn)
+    return x_fp8, scale_t.reshape(1)
 
 
 
@@ -295,19 +280,20 @@ def USP(
 
     if get_ulysses_parallel_world_size() > 1:
         if use_fp8_a2a:
-            q_fp8, q_scale = _per_tensor_quant(query)
+            scale = get_runtime_state().fp8_a2a_scale
+            q_fp8, q_descale = _per_tensor_quant(query, scale)
             query = _ft_c_input_all_to_all(q_fp8)
-            k_fp8, k_scale = _per_tensor_quant(key)
-            key   = _ft_c_input_all_to_all(k_fp8)
-            v_fp8, v_scale = _per_tensor_quant(value)
+            k_fp8, k_descale = _per_tensor_quant(key, scale)
+            key = _ft_c_input_all_to_all(k_fp8)
+            v_fp8, v_descale = _per_tensor_quant(value, scale)
             value = _ft_c_input_all_to_all(v_fp8)
-            if os.environ.get("XFUSER_FP8_LOG_SCALES") and dist.get_rank() == 0:
-                print(f"[fp8_scales] q={q_scale.item():.4f} k={k_scale.item():.4f} v={v_scale.item():.4f}")
+            if _FP8_LOG_SCALES and dist.get_rank() == 0:
+                print(f"[fp8_scales] q={q_descale.item():.4f} k={k_descale.item():.4f} v={v_descale.item():.4f}")
             attention_kwargs = (attention_kwargs or {}) | {
                 "pre_quantized": True,
-                "q_descale": q_scale.reshape(1),
-                "k_descale": k_scale.reshape(1),
-                "v_descale": v_scale.reshape(1),
+                "q_descale": q_descale,
+                "k_descale": k_descale,
+                "v_descale": v_descale,
             }
         elif combine_qkv_a2a and query.shape == key.shape == value.shape:
             query, key, value = _combined_qkv_all_to_all(query, key, value)
@@ -367,7 +353,6 @@ def attention(
         value: torch.Tensor,
         dropout_p: float = 0.0,
         is_causal: bool = False,
-        use_fp8_a2a: bool = False,
         backend=None,
         attention_kwargs=None,
     ):
