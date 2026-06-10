@@ -136,13 +136,7 @@ class RuntimeState(metaclass=ABCMeta):
             self.fp8_a2a_scale = None
             return
         ulysses_degree = config.parallel_config.sp_config.ulysses_degree or 1
-        if self.attention_backend != AttentionBackendType.AITER_FP8:
-            logger.warning(
-                f"--fp8_a2a_scale is set but attention backend is {self.attention_backend.name}, not AITER_FP8. "
-                "FP8 all-to-all will not be applied."
-            )
-            self.fp8_a2a_scale = None
-        elif ulysses_degree <= 1:
+        if ulysses_degree <= 1:
             logger.warning(
                 "--fp8_a2a_scale is set but ulysses_degree <= 1. "
                 "FP8 all-to-all will not be applied."

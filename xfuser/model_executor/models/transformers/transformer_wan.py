@@ -18,6 +18,7 @@ from xfuser.core.distributed import (
     get_runtime_state,
     get_ulysses_parallel_world_size,
 )
+from xfuser.core.distributed.attention_backend import AttentionBackendType
 from xfuser.model_executor.layers.attention_processor import (
     xFuserAttentionProcessorRegister
 )
@@ -115,6 +116,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         use_fp8_a2a = (
             not self.is_cross_attention
             and get_runtime_state().fp8_a2a_scale is not None
+            and get_runtime_state().attention_backend == AttentionBackendType.AITER_FP8
             and get_ulysses_parallel_world_size() > 1
         )
 
