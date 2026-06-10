@@ -387,7 +387,7 @@ class xFuserArgs:
             "--fp8_a2a_scale",
             type=float,
             default=None,
-            help="When set, Q/K/V are quantized to FP8 before the all-to-all using this fixed scale. Requires aiter_fp8. Use XFUSER_FP8_LOG_SCALES=1 to measure a suitable value. Good default is 1.0.",
+            help="FP8 scale for Ulysses all-to-all. When set, Q/K/V are quantized to FP8 before the all-to-all using this fixed scale, reducing communication volume by 2x. Requires --attention_backend aiter_fp8. Use XFUSER_FP8_LOG_SCALES=1 to measure a suitable value.",
         )
 
         # DiTFastAttn arguments
@@ -583,6 +583,12 @@ class xFuserArgs:
             "--use_fp4_gemms",
             action="store_true",
             help="Quantize the transformer linear layers (selected models only).",
+        )
+        parser.add_argument(
+            "--fp8_a2a_scale",
+            type=float,
+            default=None,
+            help="FP8 scale for Ulysses all-to-all. When set, Q/K/V are quantized to FP8 before the all-to-all using this fixed scale, reducing communication volume by 2x. Requires --attention_backend aiter_fp8. Use XFUSER_FP8_LOG_SCALES=1 to measure a suitable value.",
         )
 
         parser.add_argument(
