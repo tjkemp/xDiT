@@ -61,6 +61,7 @@ class RuntimeState(metaclass=ABCMeta):
     attention_backend: AttentionBackendType = AttentionBackendType.SDPA_FLASH
     cross_attention_backend: Optional[AttentionBackendType] = None
     fp8_a2a_scale: Optional[float] = None
+    fp8_a2a_scale_tensor: Optional[torch.Tensor] = None
     parallel_config: ParallelConfig
     runtime_config: RuntimeConfig
     input_config: InputConfig
@@ -146,6 +147,7 @@ class RuntimeState(metaclass=ABCMeta):
         else:
             logger.warning(f"FP8 all-to-all enabled with static scale {scale}.")
             self.fp8_a2a_scale = scale
+            self.fp8_a2a_scale_tensor = None  # created on first forward pass when device is known
 
     def set_cross_attention_backend(self, cross_attention_backend: Optional[str | AttentionBackendType]):
         """

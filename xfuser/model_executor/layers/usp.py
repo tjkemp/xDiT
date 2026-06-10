@@ -95,11 +95,10 @@ def _ft_c_input_all_to_all(x):
     return x
 
 
-def _per_tensor_quant(x: torch.Tensor, scale: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize x to FP8 using a fixed scale. Returns (x_fp8, descale) where descale is shape (1,)."""
+def _per_tensor_quant(x: torch.Tensor, scale_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize x to FP8 using a fixed pre-allocated scale tensor. Returns (x_fp8, descale)."""
     import aiter
     fp8_dtype = aiter.dtypes.fp8
-    scale_t = torch.tensor(scale, dtype=torch.float32, device=x.device)
     return aiter.per_tensor_quant(x, scale=scale_t, quant_dtype=fp8_dtype, dtypeMax=torch.finfo(fp8_dtype).max)
 
 
@@ -281,12 +280,17 @@ def USP(
 
     if get_ulysses_parallel_world_size() > 1:
         if use_fp8_a2a:
-            scale = get_runtime_state().fp8_a2a_scale
-            q_fp8, q_descale = _per_tensor_quant(query, scale)
+            runtime_state = get_runtime_state()
+            if runtime_state.fp8_a2a_scale_tensor is None:
+                runtime_state.fp8_a2a_scale_tensor = torch.tensor(
+                    runtime_state.fp8_a2a_scale, dtype=torch.float32, device=query.device
+                )
+            scale_t = runtime_state.fp8_a2a_scale_tensor
+            q_fp8, q_descale = _per_tensor_quant(query, scale_t)
             query = _ft_c_input_all_to_all(q_fp8)
-            k_fp8, k_descale = _per_tensor_quant(key, scale)
+            k_fp8, k_descale = _per_tensor_quant(key, scale_t)
             key = _ft_c_input_all_to_all(k_fp8)
-            v_fp8, v_descale = _per_tensor_quant(value, scale)
+            v_fp8, v_descale = _per_tensor_quant(value, scale_t)
             value = _ft_c_input_all_to_all(v_fp8)
             if _FP8_LOG_SCALES and dist.get_rank() == 0:
                 print(f"[fp8_scales] q={q_descale.item():.4f} k={k_descale.item():.4f} v={v_descale.item():.4f}")
