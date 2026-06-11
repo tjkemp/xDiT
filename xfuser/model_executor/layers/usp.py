@@ -73,10 +73,14 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
 
 def _sdpa_all_to_all_single(x):
     x_shape = x.shape
+    x_dtype = x.dtype
     x = x.flatten()
+    # NCCL does not support FP8 collectives on all PyTorch versions — view as uint8 (same width) for the transfer.
+    if x_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        x = x.view(torch.uint8)
     x = ft_c.all_to_all_single(x, output_split_sizes=None, input_split_sizes=None, group=PROCESS_GROUP.ULYSSES_PG)
     x = _maybe_wait(x)
-    x = x.reshape(x_shape)
+    x = x.view(x_dtype).reshape(x_shape)
     return x
 
 
