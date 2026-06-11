@@ -28,6 +28,7 @@ from xfuser.core.cache_manager.cache_manager import get_cache_manager
 from xfuser.core.distributed.attention_backend import ATTENTION_FUNCTION_REGISTRY
 
 _FP8_LOG_SCALES = bool(os.environ.get("XFUSER_FP8_LOG_SCALES"))
+_NCCL_NEEDS_FP8_VIEW = parse(torch.__version__).release < parse("2.11.0").release
 
 
 def ring_attn(attention_function, query, key, value, dropout_p=0.0, is_causal=False, joint_attn_kwargs=None, attention_kwargs=None):
@@ -75,8 +76,8 @@ def _sdpa_all_to_all_single(x):
     x_shape = x.shape
     x_dtype = x.dtype
     x = x.flatten()
-    # NCCL does not support FP8 collectives on all PyTorch versions — view as uint8 (same width) for the transfer.
-    if x_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+    # NCCL does not support FP8 collectives before PyTorch 2.11 — view as uint8 (same width) for the transfer.
+    if _NCCL_NEEDS_FP8_VIEW and x_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz):
         x = x.view(torch.uint8)
     x = ft_c.all_to_all_single(x, output_split_sizes=None, input_split_sizes=None, group=PROCESS_GROUP.ULYSSES_PG)
     x = _maybe_wait(x)
