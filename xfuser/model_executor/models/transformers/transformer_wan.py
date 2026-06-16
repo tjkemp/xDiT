@@ -16,9 +16,8 @@ from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sp_group,
     get_runtime_state,
-    get_ulysses_parallel_world_size,
 )
-from xfuser.core.distributed.attention_backend import AttentionBackendType
+from xfuser.core.distributed.attention_backend import SUPPORTS_PRE_QUANTIZATION_BACKENDS
 from xfuser.model_executor.layers.attention_processor import (
     xFuserAttentionProcessorRegister
 )
@@ -122,11 +121,10 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             query = apply_rotary_emb(query, *rotary_emb)
             key = apply_rotary_emb(key, *rotary_emb)
 
-        use_fp8_a2a = (
+        use_fp8_comms = (
             not self.is_cross_attention
-            and get_runtime_state().fp8_a2a_scale is not None
-            and get_runtime_state().attention_backend == AttentionBackendType.AITER_FP8
-            and get_ulysses_parallel_world_size() > 1
+            and get_runtime_state().fp8_comms_scale is not None
+            and get_runtime_state().attention_backend in SUPPORTS_PRE_QUANTIZATION_BACKENDS
         )
 
         # I2V task
@@ -143,7 +141,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                                                         value_img.transpose(1, 2),
                                                         backend=backend,
                                                         attention_kwargs=self.attention_kwargs,
-                                                        use_fp8_a2a=use_fp8_a2a).transpose(1, 2)
+                                                        use_fp8_comms=use_fp8_comms).transpose(1, 2)
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
 
@@ -152,7 +150,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             key.transpose(1, 2),
             value.transpose(1, 2),
             backend=backend,
-            use_fp8_a2a=use_fp8_a2a,
+            use_fp8_comms=use_fp8_comms,
             attention_kwargs=self.attention_kwargs,
         ).transpose(1, 2)
 

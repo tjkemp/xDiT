@@ -138,7 +138,8 @@ class xFuserArgs:
     cross_attention_backend: Optional[str] = None
     use_fp8_gemms: bool = False
     use_fp4_gemms: bool = False
-    fp8_a2a_scale: Optional[float] = None
+    use_fp8_comms: bool = False
+    fp8_comms_scale: float = 0.25
     # Model runner specific
     num_iterations: int = 1
     profile: bool = False
@@ -405,10 +406,15 @@ class xFuserArgs:
             help="Quantize the transformer linear layers (selected models only).",
         )
         runtime_group.add_argument(
-            "--fp8_a2a_scale",
+            "--use_fp8_comms",
+            action="store_true",
+            help="Quantize Ulysses all-to-all communication to FP8.",
+        )
+        runtime_group.add_argument(
+            "--fp8_comms_scale",
             type=float,
-            default=None,
-            help="FP8 scale for Ulysses all-to-all. When set, Q/K/V are quantized to FP8 before the all-to-all using this fixed scale, reducing communication volume by 2x. Requires --attention_backend aiter_fp8. Use XFUSER_FP8_LOG_SCALES=1 to measure a suitable value.",
+            default=0.25,
+            help="Scale factor for FP8 communication quantization. Use XFUSER_FP8_LOG_SCALES=1 to measure a suitable value.",
         )
 
         # DiTFastAttn arguments
@@ -622,10 +628,15 @@ class xFuserArgs:
             help="Quantize the transformer linear layers (selected models only).",
         )
         parser.add_argument(
-            "--fp8_a2a_scale",
+            "--use_fp8_comms",
+            action="store_true",
+            help="Quantize Ulysses all-to-all communication to FP8.",
+        )
+        parser.add_argument(
+            "--fp8_comms_scale",
             type=float,
-            default=None,
-            help="FP8 scale for Ulysses all-to-all. When set, Q/K/V are quantized to FP8 before the all-to-all using this fixed scale, reducing communication volume by 2x. Requires --attention_backend aiter_fp8. Use XFUSER_FP8_LOG_SCALES=1 to measure a suitable value.",
+            default=0.25,
+            help="Scale factor for FP8 communication quantization. Use XFUSER_FP8_LOG_SCALES=1 to measure a suitable value.",
         )
 
         parser.add_argument(
@@ -872,7 +883,8 @@ class xFuserArgs:
             use_spargeattn_static_block_mask=self.use_spargeattn_static_block_mask,
             spargeattn_simthreshold=self.spargeattn_simthreshold,
             spargeattn_cdfthreshold=self.spargeattn_cdfthreshold,
-            fp8_a2a_scale=self.fp8_a2a_scale,
+            use_fp8_comms=self.use_fp8_comms,
+            fp8_comms_scale=self.fp8_comms_scale,
         )
 
         parallel_config = ParallelConfig(

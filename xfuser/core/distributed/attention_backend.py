@@ -21,11 +21,12 @@ from xfuser.core.sparge_attention.sparge import (
 
 ATTENTION_FUNCTION_REGISTRY = {}
 
-try:
+env_info = PACKAGES_CHECKER.get_packages_info()
+if env_info.get("has_aiter"):
     import aiter as _aiter
     AITER_FP8_DTYPE = _aiter.dtypes.fp8
-except (ImportError, AttributeError):
-    AITER_FP8_DTYPE = torch.float8_e4m3fn
+else:
+    AITER_FP8_DTYPE = torch.float8_e4m3fn  # fallback only; fp8_comms requires aiter so this path is unreachable in practice
 
 def _setup_aiter_environment_variables():
     AITER_FP8_STATIC_SCALE_WITH_DESCALE = environment_variables["AITER_FP8_STATIC_SCALE_WITH_DESCALE"]()
@@ -409,6 +410,11 @@ class AttentionBackendType(Enum):
     FLEX_BLOCK_SPARGE = "Flex Block Sparge"
     AITER_FLYDSL = "AITER FlyDSL"
     NPU = "NPU"
+
+SUPPORTS_PRE_QUANTIZATION_BACKENDS = {
+    AttentionBackendType.AITER_FP8,
+    AttentionBackendType.AITER_SAGE_V2,
+}
 
 def register_attention_function(backend_type):
     """
