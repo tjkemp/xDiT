@@ -291,14 +291,16 @@ def USP(
                     runtime_state.fp8_a2a_scale, dtype=torch.float32, device=query.device
                 )
             scale_t = runtime_state.fp8_a2a_scale_tensor
+            if _FP8_LOG_SCALES:
+                q_amax = query.abs().amax().item()
+                k_amax = key.abs().amax().item()
+                v_amax = value.abs().amax().item()
             q_fp8, q_descale = _per_tensor_quant(query, scale_t)
             query = _ft_c_input_all_to_all(q_fp8)
             k_fp8, k_descale = _per_tensor_quant(key, scale_t)
             key = _ft_c_input_all_to_all(k_fp8)
             v_fp8, v_descale = _per_tensor_quant(value, scale_t)
             value = _ft_c_input_all_to_all(v_fp8)
-            if _FP8_LOG_SCALES and dist.get_rank() == 0:
-                print(f"[fp8_scales] q={q_descale.item():.4f} k={k_descale.item():.4f} v={v_descale.item():.4f}")
             attention_kwargs = (attention_kwargs or {}) | {
                 "pre_quantized": True,
                 "q_descale": q_descale,
@@ -352,7 +354,16 @@ def USP(
                             is_causal=is_causal,
                             joint_attn_kwargs=joint_attn_kwargs,
                             attention_kwargs=attention_kwargs)
-        out = _ft_c_output_all_to_all(out)
+        if use_fp8_a2a:
+            if _FP8_LOG_SCALES:
+                out_amax = out.abs().amax().item()
+                rank = dist.get_rank()
+                print(f"[fp8_scales rank{rank}] q_amax={q_amax:.4f} k_amax={k_amax:.4f} v_amax={v_amax:.4f} out_amax={out_amax:.4f}")
+            out_dtype = out.dtype
+            out_fp8, _ = _per_tensor_quant(out, scale_t)
+            out = _ft_c_output_all_to_all(out_fp8).to(out_dtype)
+        else:
+            out = _ft_c_output_all_to_all(out)
 
     return out
 
