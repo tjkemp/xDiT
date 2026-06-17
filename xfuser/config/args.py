@@ -138,6 +138,8 @@ class xFuserArgs:
     cross_attention_backend: Optional[str] = None
     use_fp8_gemms: bool = False
     use_fp4_gemms: bool = False
+    use_fp8_comms: bool = False
+    fp8_comms_scale: Optional[float] = None
     # Model runner specific
     num_iterations: int = 1
     profile: bool = False
@@ -403,6 +405,17 @@ class xFuserArgs:
             action="store_true",
             help="Quantize the transformer linear layers (selected models only).",
         )
+        runtime_group.add_argument(
+            "--use_fp8_comms",
+            action="store_true",
+            help="Quantize Ulysses all-to-all communication to FP8.",
+        )
+        runtime_group.add_argument(
+            "--fp8_comms_scale",
+            type=float,
+            default=None,
+            help="Override the model-specific FP8 communication scale.",
+        )
 
         # DiTFastAttn arguments
         fast_attn_group = parser.add_argument_group("DiTFastAttn Options")
@@ -613,6 +626,17 @@ class xFuserArgs:
             "--use_fp4_gemms",
             action="store_true",
             help="Quantize the transformer linear layers (selected models only).",
+        )
+        parser.add_argument(
+            "--use_fp8_comms",
+            action="store_true",
+            help="Quantize Ulysses all-to-all communication to FP8.",
+        )
+        parser.add_argument(
+            "--fp8_comms_scale",
+            type=float,
+            default=None,
+            help="Override the model-specific FP8 communication scale.",
         )
 
         parser.add_argument(
@@ -859,6 +883,8 @@ class xFuserArgs:
             use_spargeattn_static_block_mask=self.use_spargeattn_static_block_mask,
             spargeattn_simthreshold=self.spargeattn_simthreshold,
             spargeattn_cdfthreshold=self.spargeattn_cdfthreshold,
+            use_fp8_comms=self.use_fp8_comms,
+            fp8_comms_scale=self.fp8_comms_scale,
         )
 
         parallel_config = ParallelConfig(

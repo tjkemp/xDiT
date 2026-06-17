@@ -1,5 +1,7 @@
 # This file implements USP with torch version >= '2.5.0'
+import os
 import torch
+import torch.distributed as dist
 import functools
 
 import torch.distributed._functional_collectives as ft_c
@@ -24,6 +26,10 @@ from xfuser.core.distributed import (
 from packaging.version import parse
 from xfuser.core.cache_manager.cache_manager import get_cache_manager
 from xfuser.core.distributed.attention_backend import ATTENTION_FUNCTION_REGISTRY
+
+_FP8_LOG_SCALES = bool(os.environ.get("XFUSER_FP8_LOG_SCALES"))
+_FP8_NCCL_NEEDS_VIEW = parse(torch.__version__).release < parse("2.11.0").release
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
 
 
 def ring_attn(attention_function, query, key, value, dropout_p=0.0, is_causal=False, joint_attn_kwargs=None, attention_kwargs=None):
@@ -69,10 +75,14 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
 
 def _sdpa_all_to_all_single(x):
     x_shape = x.shape
+    x_dtype = x.dtype
     x = x.flatten()
+    # NCCL does not support FP8 collectives before PyTorch 2.11, view as uint8 (same width) for the transfer.
+    if _FP8_NCCL_NEEDS_VIEW and x_dtype in _FP8_DTYPES:
+        x = x.view(torch.uint8)
     x = ft_c.all_to_all_single(x, output_split_sizes=None, input_split_sizes=None, group=PROCESS_GROUP.ULYSSES_PG)
     x = _maybe_wait(x)
-    x = x.reshape(x_shape)
+    x = x.view(x_dtype).reshape(x_shape)
     return x
 
 
@@ -89,6 +99,52 @@ def _ft_c_input_all_to_all(x):
     x = _sdpa_all_to_all_single(x)
     x = x.reshape(world_size, h // world_size, b, -1, d).permute(2, 1, 0, 3, 4).reshape(b, h // world_size, -1, d)
     return x
+
+
+def _per_tensor_quant(x: torch.Tensor, scale_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize x to FP8 using a fixed pre-allocated scale tensor. Returns (x_fp8, descale)."""
+    import aiter
+    fp8_dtype = aiter.dtypes.fp8
+    return aiter.per_tensor_quant(x, scale=scale_t, quant_dtype=fp8_dtype, dtypeMax=torch.finfo(fp8_dtype).max)
+
+
+def _fp8_comms_input_all_to_all(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> tuple:
+    """Quantize Q/K/V to FP8 and run interleaved input all-to-alls.
+
+    Returns (query, key, value, attn_kwargs_update, scale_t, qkv_amaxes).
+    qkv_amaxes is (q_amax, k_amax, v_amax) when XFUSER_FP8_LOG_SCALES is set, else None.
+    """
+    runtime_state = get_runtime_state()
+    if runtime_state.fp8_comms_scale_tensor is None:
+        runtime_state.fp8_comms_scale_tensor = torch.tensor(
+            runtime_state.fp8_comms_scale, dtype=torch.float32, device=query.device
+        )
+    scale_t = runtime_state.fp8_comms_scale_tensor
+
+    qkv_amaxes = (
+        (query.abs().amax().item(), key.abs().amax().item(), value.abs().amax().item())
+        if _FP8_LOG_SCALES else None
+    )
+
+    q_fp8, q_descale = _per_tensor_quant(query, scale_t)
+    query = _ft_c_input_all_to_all(q_fp8)
+    k_fp8, k_descale = _per_tensor_quant(key, scale_t)
+    key = _ft_c_input_all_to_all(k_fp8)
+    v_fp8, v_descale = _per_tensor_quant(value, scale_t)
+    value = _ft_c_input_all_to_all(v_fp8)
+
+    attn_kwargs_update = {
+        "pre_quantized": True,
+        "q_descale": q_descale,
+        "k_descale": k_descale,
+        "v_descale": v_descale,
+    }
+    return query, key, value, attn_kwargs_update, scale_t, qkv_amaxes
+
 
 
 def _combined_qkv_all_to_all(q, k, v):
@@ -227,6 +283,7 @@ def concat_joint_tensors_decorator(func):
         return func(query, key, value, dropout_p=dropout_p, is_causal=is_causal, attention_kwargs=attention_kwargs)
     return wrapper
 
+
 def USP(
         query: torch.Tensor,
         key: torch.Tensor,
@@ -239,6 +296,7 @@ def USP(
         joint_strategy: str | None = None,
         attn_layer=None,
         combine_qkv_a2a: bool | None = None,
+        use_fp8_comms: bool = False,
         backend=None,
         attention_kwargs: dict | None = None,
     ):
@@ -265,8 +323,13 @@ def USP(
 
         }
 
+    scale_t = None
+    qkv_amaxes = None
     if get_ulysses_parallel_world_size() > 1:
-        if combine_qkv_a2a and query.shape == key.shape == value.shape:
+        if use_fp8_comms:
+            query, key, value, attn_kwargs_update, scale_t, qkv_amaxes = _fp8_comms_input_all_to_all(query, key, value)
+            attention_kwargs = (attention_kwargs or {}) | attn_kwargs_update
+        elif combine_qkv_a2a and query.shape == key.shape == value.shape:
             query, key, value = _combined_qkv_all_to_all(query, key, value)
         else:
             query = _ft_c_input_all_to_all(query)
@@ -313,7 +376,20 @@ def USP(
                             is_causal=is_causal,
                             joint_attn_kwargs=joint_attn_kwargs,
                             attention_kwargs=attention_kwargs)
-        out = _ft_c_output_all_to_all(out)
+        if use_fp8_comms:
+            if _FP8_LOG_SCALES and qkv_amaxes is not None:
+                out_amax = out.abs().amax().item()
+                rank = dist.get_rank()
+                q_amax, k_amax, v_amax = qkv_amaxes
+                print(f"[fp8_scales rank{rank}] q_amax={q_amax:.4f} k_amax={k_amax:.4f} v_amax={v_amax:.4f} out_amax={out_amax:.4f}")
+            out_dtype = out.dtype
+            if out.dtype not in _FP8_DTYPES:
+                out_fp8, out_descale = _per_tensor_quant(out, scale_t)
+            else:
+                out_fp8, out_descale = out, scale_t
+            out = (_ft_c_output_all_to_all(out_fp8).float() * out_descale).to(out_dtype)
+        else:
+            out = _ft_c_output_all_to_all(out)
 
     return out
 
@@ -324,6 +400,7 @@ def attention(
         value: torch.Tensor,
         dropout_p: float = 0.0,
         is_causal: bool = False,
+        use_fp8_comms: bool = False,  # accepted for call-site uniformity with USP(), never applied
         backend=None,
         attention_kwargs=None,
     ):

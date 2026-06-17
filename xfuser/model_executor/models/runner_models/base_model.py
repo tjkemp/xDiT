@@ -43,7 +43,7 @@ from xfuser.core.distributed import (
     init_distributed_environment,
     shard_component,
 )
-from xfuser.core.distributed.attention_backend import AttentionBackendType
+from xfuser.core.distributed.attention_backend import AttentionBackendType, SUPPORTS_PRE_QUANTIZATION_BACKENDS
 from xfuser.core.distributed.attention_schedule import AttentionSchedule, create_hybrid_attn_schedule, create_hybrid_gemm_schedule
 
 
@@ -119,6 +119,8 @@ class ModelCapabilities:
     # Other features
     use_fp8_gemms: bool = False
     use_fp4_gemms: bool = False
+    use_fp8_comms: bool = False
+    fp8_comms_default_scale: Optional[float] = None
     use_fbcache: bool = False
     use_hybrid_attn_schedule: bool = False
     use_hybrid_gemm_schedule: bool = False
@@ -339,6 +341,30 @@ class xFuserModel(abc.ABC):
             raise ValueError(f"Model {self.settings.model_name} requires a task to be specified. Supported tasks: {self.settings.valid_tasks}")
         if config.dataset_path and not config.batch_size:
             raise ValueError(f"Dataset path specified without batch size. Please specify batch size for dataset inference.")
+
+        if config.use_fp8_comms:
+            if not self.capabilities.use_fp8_comms:
+                raise ValueError(f"Model {self.settings.model_name} does not support --use_fp8_comms.")
+            if (config.ulysses_degree or 1) <= 1:
+                raise ValueError("--use_fp8_comms requires ulysses_degree > 1.")
+            effective_backends = set()
+            if config.attention_backend:
+                effective_backends.add(_parse_attention_backend(config.attention_backend, "attention backend"))
+            if config.use_hybrid_attn_schedule and config.hybrid_attn_low_precision_backend:
+                effective_backends.add(_parse_attention_backend(config.hybrid_attn_low_precision_backend, "hybrid low-precision attention backend"))
+            if not effective_backends & SUPPORTS_PRE_QUANTIZATION_BACKENDS:
+                raise ValueError(
+                    f"--use_fp8_comms requires an attention backend that supports pre-quantization "
+                    f"({', '.join(b.name for b in SUPPORTS_PRE_QUANTIZATION_BACKENDS)}). "
+                    f"Set --attention_backend or --hybrid_attn_low_precision_backend accordingly."
+                )
+            if self.capabilities.fp8_comms_default_scale is None and config.fp8_comms_scale is None:
+                raise ValueError(
+                    f"--use_fp8_comms is enabled but model {self.settings.model_name} has no default "
+                    f"FP8 communication scale. Pass --fp8_comms_scale to set one explicitly."
+                )
+            if config.fp8_comms_scale is None:
+                config.fp8_comms_scale = self.capabilities.fp8_comms_default_scale
 
         if self.model_output_type == "video" and not self.fps:
             raise ValueError(f"Model {self.settings.model_name} produces video output but fps is not set.")
