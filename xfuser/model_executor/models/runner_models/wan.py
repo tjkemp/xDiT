@@ -180,7 +180,6 @@ class xFuserWan21I2VModel(xFuserModel):
         use_fp8_gemms=True,
         use_cfg_parallel=True,
         use_fp4_gemms=True,
-        use_fp8_comms=True,
         use_hybrid_attn_schedule=True,
         use_parallel_vae=True,
         use_parallel_vae_encoder=True,
@@ -283,6 +282,24 @@ class xFuserWan21I2VModel(xFuserModel):
 @register_model("Wan-AI/Wan2.2-I2V-A14B-Diffusers")
 @register_model("Wan2.2-I2V")
 class xFuserWan22I2VModel(xFuserWan21I2VModel):
+
+    capabilities = ModelCapabilities(
+        ulysses_degree=True,
+        ring_degree=True,
+        fully_shard_degree=True,
+        use_fp8_gemms=True,
+        use_cfg_parallel=True,
+        use_fp4_gemms=True,
+        use_fp8_comms=True,
+        fp8_comms_default_scale=0.25,
+        use_hybrid_attn_schedule=True,
+        use_parallel_vae=True,
+        use_parallel_vae_encoder=True,
+        cross_attention_backend=True,
+        supports_sparge_attention_backends=True,
+        enable_tiling=True,
+        enable_slicing=True,
+    )
 
     def __init__(self, config: xFuserArgs) -> None:
         self.settings.model_name = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
@@ -454,7 +471,6 @@ class xFuserWan21T2VModel(xFuserModel):
         fully_shard_degree=True,
         use_fp8_gemms=True,
         use_fp4_gemms=True,
-        use_fp8_comms=True,
         use_hybrid_attn_schedule=True,
         use_parallel_vae=True,
         cross_attention_backend=True,
@@ -536,6 +552,22 @@ class xFuserWan21T2VModel(xFuserModel):
 @register_model("Wan2.2-T2V")
 class xFuserWan22T2VModel(xFuserWan21T2VModel):
 
+    capabilities = ModelCapabilities(
+        ulysses_degree=True,
+        ring_degree=True,
+        fully_shard_degree=True,
+        use_fp8_gemms=True,
+        use_fp4_gemms=True,
+        use_fp8_comms=True,
+        fp8_comms_default_scale=0.25,
+        use_hybrid_attn_schedule=True,
+        use_parallel_vae=True,
+        cross_attention_backend=True,
+        supports_sparge_attention_backends=True,
+        enable_tiling=True,
+        enable_slicing=True,
+    )
+
     def __init__(self, config: xFuserArgs) -> None:
         super().__init__(config)
         self.settings.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
@@ -587,6 +619,7 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
         use_fp8_gemms=True,
         use_fp4_gemms=True,
         use_fp8_comms=True,
+        fp8_comms_default_scale=0.25,
         use_hybrid_attn_schedule=True,
         use_hybrid_gemm_schedule=True,
         use_parallel_vae=True,

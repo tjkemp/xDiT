@@ -69,7 +69,7 @@ class RuntimeConfig:
     spargeattn_simthreshold: float = 0.3
     spargeattn_cdfthreshold: float = 0.92
     use_fp8_comms: bool = False
-    fp8_comms_scale: float = 0.25
+    fp8_comms_scale: Optional[float] = None
 
     def __post_init__(self):
         check_packages()

@@ -139,7 +139,7 @@ class xFuserArgs:
     use_fp8_gemms: bool = False
     use_fp4_gemms: bool = False
     use_fp8_comms: bool = False
-    fp8_comms_scale: float = 0.25
+    fp8_comms_scale: Optional[float] = None
     # Model runner specific
     num_iterations: int = 1
     profile: bool = False
@@ -413,8 +413,8 @@ class xFuserArgs:
         runtime_group.add_argument(
             "--fp8_comms_scale",
             type=float,
-            default=0.25,
-            help="Scale factor for FP8 communication quantization. Use XFUSER_FP8_LOG_SCALES=1 to measure a suitable value.",
+            default=None,
+            help="Override the model-specific FP8 communication scale.",
         )
 
         # DiTFastAttn arguments
@@ -635,8 +635,8 @@ class xFuserArgs:
         parser.add_argument(
             "--fp8_comms_scale",
             type=float,
-            default=0.25,
-            help="Scale factor for FP8 communication quantization. Use XFUSER_FP8_LOG_SCALES=1 to measure a suitable value.",
+            default=None,
+            help="Override the model-specific FP8 communication scale.",
         )
 
         parser.add_argument(
