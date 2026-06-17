@@ -363,9 +363,7 @@ class xFuserModel(abc.ABC):
                     f"--use_fp8_comms is enabled but model {self.settings.model_name} has no default "
                     f"FP8 communication scale. Pass --fp8_comms_scale to set one explicitly."
                 )
-            if config.fp8_comms_scale is not None:
-                logger.warning(f"Overriding model default FP8 communication scale with {config.fp8_comms_scale}.")
-            else:
+            if config.fp8_comms_scale is None:
                 config.fp8_comms_scale = self.capabilities.fp8_comms_default_scale
 
         if self.model_output_type == "video" and not self.fps:
