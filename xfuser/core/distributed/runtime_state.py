@@ -193,7 +193,7 @@ class RuntimeState(metaclass=ABCMeta):
     def sync_fp8_comms_running_max(self):
         """All-reduce running amaxes across Ulysses ranks and update scales in-place."""
         fp8_comms = self.fp8_comms
-        if fp8_comms is None or fp8_comms.fixed_scale is not None:
+        if fp8_comms is None or fp8_comms.fixed_scale is not None or not fp8_comms._on_device:
             return
         from xfuser.core.distributed.attention_backend import AITER_FP8_DTYPE
         dtype_max = torch.finfo(AITER_FP8_DTYPE).max
