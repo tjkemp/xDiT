@@ -11,6 +11,7 @@ from torch.cuda import manual_seed_all as device_manual_seed_all
 import diffusers
 from diffusers import DiffusionPipeline
 import torch.distributed
+import torch.distributed as dist
 
 try:
     import torch_musa
@@ -21,6 +22,11 @@ except ModuleNotFoundError:
 
 import xfuser.envs as envs
 from xfuser.envs import PACKAGES_CHECKER
+
+if torch.cuda.is_available() or envs._is_npu():
+    from yunchang.globals import PROCESS_GROUP
+else:
+    PROCESS_GROUP = None
 if envs._is_npu():
     from torch.npu import manual_seed as device_manual_seed
     from torch.npu import manual_seed_all as device_manual_seed_all
@@ -50,6 +56,8 @@ logger = init_logger(__name__)
 
 env_info = PACKAGES_CHECKER.get_packages_info()
 
+_FP8_COMMS_SAFETY_FACTOR = 0.85  # leave 15% headroom above observed amax when computing scale
+
 def set_random_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -58,29 +66,35 @@ def set_random_seed(seed: int):
     device_manual_seed_all(seed)
 
 
-@dataclass
 class Fp8CommsState:
-    """Holds all state for FP8 Ulysses all-to-all communication."""
-    q_scales: Optional[list] = None       # per-layer q scale tensors, None until static
-    k_scales: Optional[list] = None       # per-layer k scale tensors, None until static
-    v_scales: Optional[list] = None       # per-layer v scale tensors, None until static
-    static: bool = False                  # True = scales ready to use (calibrated or fixed)
-    layer_amaxes: Optional[list] = None   # [(q_amax, k_amax, v_amax), ...] during calibration
-    call_counter: int = 0                 # layer index within a denoising step
+    """Holds all state for FP8 Ulysses all-to-all communication.
 
-    def allocate_calibration(self, n_layers: int):
-        """Pre-allocate a fixed-size amax buffer to avoid recompilation during calibration."""
-        self.layer_amaxes = torch.zeros(n_layers, 3, dtype=torch.float32)
+    All tensors are pre-allocated on CPU and moved to GPU on first forward pass.
+    No None checks after initialization -- guards are stable for torch.compile.
+    Scales are updated via copy_() so object identity never changes.
+    """
+    def __init__(self, fixed_scale: Optional[float] = None):
+        self.fixed_scale = fixed_scale
+        # pre-allocate on CPU; moved to device on first forward pass via to_()
+        init = float(fixed_scale) if fixed_scale is not None else 1.0
+        self.q_scale = torch.tensor([init], dtype=torch.float32)
+        self.k_scale = torch.tensor([init], dtype=torch.float32)
+        self.v_scale = torch.tensor([init], dtype=torch.float32)
+        self.q_running_max = torch.zeros(1, dtype=torch.float32)
+        self.k_running_max = torch.zeros(1, dtype=torch.float32)
+        self.v_running_max = torch.zeros(1, dtype=torch.float32)
+        self._on_device = False
 
-    def reset_calibration(self):
-        """Reset to uncalibrated state for recalibration on next iteration."""
-        self.q_scales = None
-        self.k_scales = None
-        self.v_scales = None
-        self.static = False
-        if isinstance(self.layer_amaxes, torch.Tensor):
-            self.layer_amaxes.zero_()
-        self.call_counter = 0
+    def to_device_(self, device: torch.device):
+        if self._on_device:
+            return
+        self.q_scale = self.q_scale.to(device)
+        self.k_scale = self.k_scale.to(device)
+        self.v_scale = self.v_scale.to(device)
+        self.q_running_max = self.q_running_max.to(device)
+        self.k_running_max = self.k_running_max.to(device)
+        self.v_running_max = self.v_running_max.to(device)
+        self._on_device = True
 
 
 class RuntimeState(metaclass=ABCMeta):
@@ -171,23 +185,27 @@ class RuntimeState(metaclass=ABCMeta):
             return
         fixed_scale = config.runtime_config.fp8_comms_scale
         if fixed_scale is not None:
-            logger.warning(f"FP8 communication enabled with fixed scale {fixed_scale} for all layers.")
-            self.fp8_comms = Fp8CommsState(static=True)
-            # scale tensors created lazily on first forward pass when device is known
-            self.fp8_comms._fixed_scale = fixed_scale
+            logger.warning(f"FP8 communication enabled with fixed scale {fixed_scale}.")
         else:
-            logger.warning("FP8 communication enabled. Will calibrate per-layer per-tensor scales on first iteration.")
-            self.fp8_comms = Fp8CommsState(layer_amaxes=[])
+            logger.warning("FP8 communication enabled with dynamic scaling (running max, synced per step).")
+        self.fp8_comms = Fp8CommsState(fixed_scale=fixed_scale)
 
-    def reset_fp8_comms_calibration(self):
-        """Reset to uncalibrated state so the next generation recalibrates per-layer scales."""
-        if self.fp8_comms is None:
+    def sync_fp8_comms_running_max(self):
+        """All-reduce running amaxes across Ulysses ranks and update scales in-place."""
+        fp8_comms = self.fp8_comms
+        if fp8_comms is None or fp8_comms.fixed_scale is not None:
             return
-        if not self.fp8_comms.static:
-            return  # already uncalibrated
-        if hasattr(self.fp8_comms, '_fixed_scale'):
-            return  # fixed scale override, never recalibrate
-        self.fp8_comms.reset_calibration()
+        from xfuser.core.distributed.attention_backend import AITER_FP8_DTYPE
+        dtype_max = torch.finfo(AITER_FP8_DTYPE).max
+        maxes = torch.cat([fp8_comms.q_running_max, fp8_comms.k_running_max, fp8_comms.v_running_max])
+        dist.all_reduce(maxes, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
+        scales = maxes / (dtype_max * _FP8_COMMS_SAFETY_FACTOR)
+        fp8_comms.q_scale.copy_(scales[0:1])
+        fp8_comms.k_scale.copy_(scales[1:2])
+        fp8_comms.v_scale.copy_(scales[2:3])
+        fp8_comms.q_running_max.zero_()
+        fp8_comms.k_running_max.zero_()
+        fp8_comms.v_running_max.zero_()
 
     def set_cross_attention_backend(self, cross_attention_backend: Optional[str | AttentionBackendType]):
         """
@@ -387,11 +405,6 @@ class DiTRuntimeState(RuntimeState):
         super().__init__(config)
         self.patch_mode = False
         self.pipeline_patch_idx = 0
-        if self.fp8_comms is not None and not self.fp8_comms.static:
-            n_layers = getattr(getattr(pipeline, "transformer", None), "config", None)
-            n_layers = getattr(n_layers, "num_layers", None) if n_layers else None
-            if n_layers is not None:
-                self.fp8_comms.allocate_calibration(n_layers)
         self._check_model_and_parallel_config(
             pipeline=pipeline, parallel_config=config.parallel_config
         )
@@ -476,17 +489,10 @@ class DiTRuntimeState(RuntimeState):
             self.use_high_precision_gemm = self.gemm_schedule.is_high_precision(current_step)
 
         self.step_counter = self.step_counter + 1
-        if self.fp8_comms is not None:
-            self.fp8_comms.call_counter = 0  # reset layer index at each new denoising step
-
-        # finalize calibration after the first iteration
-        if self.step_counter == 1 and self.fp8_comms is not None and not self.fp8_comms.static and self.fp8_comms.layer_amaxes:
-            from xfuser.model_executor.layers.usp import _fp8_comms_finalize_calibration
-            _fp8_comms_finalize_calibration(torch.device("cuda", torch.cuda.current_device()))
+        self.sync_fp8_comms_running_max()
 
         if self.step_counter >= active_total_steps:
             self.step_counter = 0
-            self.reset_fp8_comms_calibration()
 
     def set_attention_schedule(
         self,

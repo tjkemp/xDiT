@@ -108,9 +108,9 @@ def _per_tensor_quant(x: torch.Tensor, scale_t: torch.Tensor) -> tuple[torch.Ten
     return aiter.per_tensor_quant(x, scale=scale_t, quant_dtype=fp8_dtype, dtypeMax=torch.finfo(fp8_dtype).max)
 
 
-_FP8_COMMS_SAFETY_FACTOR = 0.85  # leave 15% headroom above observed amax
-
-
+def _fp8_comms_ensure_on_device(fp8_comms, device: torch.device):
+    """Move fp8_comms tensors to GPU on first forward pass."""
+    fp8_comms.to_device_(device)
 
 
 def _fp8_comms_input_all_to_all(
@@ -118,40 +118,31 @@ def _fp8_comms_input_all_to_all(
     key: torch.Tensor,
     value: torch.Tensor,
 ) -> tuple:
-    """Quantize Q/K/V to FP8 using per-layer per-tensor scales and run interleaved input all-to-alls.
+    """Quantize Q/K/V to FP8 using dynamic running max scales and run interleaved input all-to-alls.
 
-    Returns (query, key, value, attn_kwargs_update, (q_scale_t, k_scale_t, v_scale_t), qkv_amaxes).
-    qkv_amaxes is (q_amax, k_amax, v_amax) when XFUSER_FP8_LOG_SCALES is set, else None.
+    Scales are updated in-place each call and synced across Ulysses ranks once per denoising step.
+    Returns (query, key, value, attn_kwargs_update, (q_scale, k_scale, v_scale), qkv_amaxes).
     """
     fp8_comms = get_runtime_state().fp8_comms
-    layer_idx = fp8_comms.call_counter
-    fp8_comms.call_counter += 1
+    _fp8_comms_ensure_on_device(fp8_comms, query.device)
+    q_scale, k_scale, v_scale = fp8_comms.q_scale, fp8_comms.k_scale, fp8_comms.v_scale
 
-    if hasattr(fp8_comms, '_fixed_scale'):
-        # fixed scale: create tensors once on first call, reuse for all layers
-        if fp8_comms.q_scales is None:
-            s = torch.tensor(fp8_comms._fixed_scale, dtype=torch.float32, device=query.device)
-            fp8_comms.q_scales = [s]
-            fp8_comms.k_scales = [s]
-            fp8_comms.v_scales = [s]
-        q_scale_t = fp8_comms.q_scales[0]
-        k_scale_t = fp8_comms.k_scales[0]
-        v_scale_t = fp8_comms.v_scales[0]
-    else:
-        q_scale_t = fp8_comms.q_scales[layer_idx]
-        k_scale_t = fp8_comms.k_scales[layer_idx]
-        v_scale_t = fp8_comms.v_scales[layer_idx]
+    # update running max in-place (stable tensor shapes, no recompile)
+    if fp8_comms.fixed_scale is None:
+        torch.maximum(fp8_comms.q_running_max, query.abs().amax().unsqueeze(0), out=fp8_comms.q_running_max)
+        torch.maximum(fp8_comms.k_running_max, key.abs().amax().unsqueeze(0), out=fp8_comms.k_running_max)
+        torch.maximum(fp8_comms.v_running_max, value.abs().amax().unsqueeze(0), out=fp8_comms.v_running_max)
 
     qkv_amaxes = (
         (query.abs().amax().item(), key.abs().amax().item(), value.abs().amax().item())
         if _FP8_LOG_SCALES else None
     )
 
-    q_fp8, q_descale = _per_tensor_quant(query, q_scale_t)
+    q_fp8, q_descale = _per_tensor_quant(query, q_scale)
     query = _ft_c_input_all_to_all(q_fp8)
-    k_fp8, k_descale = _per_tensor_quant(key, k_scale_t)
+    k_fp8, k_descale = _per_tensor_quant(key, k_scale)
     key = _ft_c_input_all_to_all(k_fp8)
-    v_fp8, v_descale = _per_tensor_quant(value, v_scale_t)
+    v_fp8, v_descale = _per_tensor_quant(value, v_scale)
     value = _ft_c_input_all_to_all(v_fp8)
 
     attn_kwargs_update = {
@@ -160,7 +151,7 @@ def _fp8_comms_input_all_to_all(
         "k_descale": k_descale,
         "v_descale": v_descale,
     }
-    return query, key, value, attn_kwargs_update, (q_scale_t, k_scale_t, v_scale_t), qkv_amaxes
+    return query, key, value, attn_kwargs_update, (q_scale, k_scale, v_scale), qkv_amaxes
 
 
 def _fp8_comms_output_all_to_all(out: torch.Tensor, v_scale_t: torch.Tensor) -> torch.Tensor:
@@ -171,27 +162,6 @@ def _fp8_comms_output_all_to_all(out: torch.Tensor, v_scale_t: torch.Tensor) -> 
     else:
         out_fp8, out_descale = out, v_scale_t
     return (_ft_c_output_all_to_all(out_fp8).float() * out_descale).to(out_dtype)
-
-
-def _fp8_comms_finalize_calibration(device: torch.device):
-    """All-reduce per-layer per-tensor amaxes and compute separate q/k/v scales per layer."""
-    fp8_comms = get_runtime_state().fp8_comms
-    if fp8_comms is None or not isinstance(fp8_comms.layer_amaxes, torch.Tensor):
-        return
-    from xfuser.core.distributed.attention_backend import AITER_FP8_DTYPE
-    dtype_max = torch.finfo(AITER_FP8_DTYPE).max
-    # layer_amaxes is (n_layers, 3) on cpu; move to device and transpose to (3, n_layers)
-    local = fp8_comms.layer_amaxes.to(device).T.contiguous()
-    dist.all_reduce(local, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
-    scales = local / (dtype_max * _FP8_COMMS_SAFETY_FACTOR)  # (3, n_layers)
-    n_layers = scales.shape[1]
-    fp8_comms.q_scales = [scales[0, i].clone() for i in range(n_layers)]
-    fp8_comms.k_scales = [scales[1, i].clone() for i in range(n_layers)]
-    fp8_comms.v_scales = [scales[2, i].clone() for i in range(n_layers)]
-    fp8_comms.static = True
-    fp8_comms.layer_amaxes = None
-    if dist.get_rank() == 0:
-        print(f"[fp8_comms] calibrated {n_layers} layers: max_scale q={scales[0].max():.6f} k={scales[1].max():.6f} v={scales[2].max():.6f}")
 
 
 def _combined_qkv_all_to_all(q, k, v):
@@ -370,29 +340,12 @@ def USP(
 
         }
 
-    qkv_scales = None  # (q_scale_t, k_scale_t, v_scale_t) after calibration
+    qkv_scales = None
     qkv_amaxes = None
-    _calibrating = False
     if get_ulysses_parallel_world_size() > 1:
         if use_fp8_comms:
-            fp8_comms = get_runtime_state().fp8_comms
-            if not fp8_comms.static:
-                # calibration iteration: launch BF16 all-to-alls, compute amaxes while NCCL transfers
-                _calibrating = True
-                q_amax_t = query.abs().amax()
-                query = _ft_c_input_all_to_all(query)
-                k_amax_t = key.abs().amax()
-                key = _ft_c_input_all_to_all(key)
-                v_amax_t = value.abs().amax()
-                value = _ft_c_input_all_to_all(value)
-                idx = fp8_comms.call_counter
-                fp8_comms.layer_amaxes[idx, 0] = q_amax_t
-                fp8_comms.layer_amaxes[idx, 1] = k_amax_t
-                fp8_comms.layer_amaxes[idx, 2] = v_amax_t
-                fp8_comms.call_counter += 1
-            else:
-                query, key, value, attn_kwargs_update, qkv_scales, qkv_amaxes = _fp8_comms_input_all_to_all(query, key, value)
-                attention_kwargs = (attention_kwargs or {}) | attn_kwargs_update
+            query, key, value, attn_kwargs_update, qkv_scales, qkv_amaxes = _fp8_comms_input_all_to_all(query, key, value)
+            attention_kwargs = (attention_kwargs or {}) | attn_kwargs_update
         elif combine_qkv_a2a and query.shape == key.shape == value.shape:
             query, key, value = _combined_qkv_all_to_all(query, key, value)
         else:
@@ -440,7 +393,7 @@ def USP(
                             is_causal=is_causal,
                             joint_attn_kwargs=joint_attn_kwargs,
                             attention_kwargs=attention_kwargs)
-        if use_fp8_comms and not _calibrating:
+        if use_fp8_comms:
             if _FP8_LOG_SCALES and qkv_amaxes is not None:
                 out_amax = out.abs().amax().item()
                 rank = dist.get_rank()
