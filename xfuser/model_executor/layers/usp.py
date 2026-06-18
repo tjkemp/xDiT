@@ -108,13 +108,6 @@ def _per_tensor_quant(x: torch.Tensor, scale_t: torch.Tensor) -> tuple[torch.Ten
     return aiter.per_tensor_quant(x, scale=scale_t, quant_dtype=fp8_dtype, dtypeMax=torch.finfo(fp8_dtype).max)
 
 
-def _per_tensor_quant_dynamic(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize x to FP8 computing amax internally -- one pass, no separate amax kernel.
-    Returns (x_fp8, scale) where scale is the computed per-tensor scale."""
-    import aiter
-    fp8_dtype = aiter.dtypes.fp8
-    return aiter.per_tensor_quant(x, scale=None, quant_dtype=fp8_dtype, dtypeMax=torch.finfo(fp8_dtype).max)
-
 
 def _fp8_comms_ensure_on_device(fp8_comms, device: torch.device):
     """Move fp8_comms tensors to GPU on first forward pass."""
@@ -135,25 +128,21 @@ def _fp8_comms_input_all_to_all(
     _fp8_comms_ensure_on_device(fp8_comms, query.device)
     q_scale, k_scale, v_scale = fp8_comms.q_scale, fp8_comms.k_scale, fp8_comms.v_scale
 
+    # always quantize with shared synced scale so all ranks agree on encoding
+    q_fp8, q_descale = _per_tensor_quant(query, q_scale)
     if fp8_comms.fixed_scale is None:
-        # dynamic path: aiter computes amax internally in one pass, we use returned scale
-        # to update the running max -- no separate amax kernel
-        q_fp8, q_descale = _per_tensor_quant_dynamic(query)
-        torch.maximum(fp8_comms.q_running_max, q_descale, out=fp8_comms.q_running_max)
-        query = _ft_c_input_all_to_all(q_fp8)
-        k_fp8, k_descale = _per_tensor_quant_dynamic(key)
-        torch.maximum(fp8_comms.k_running_max, k_descale, out=fp8_comms.k_running_max)
-        key = _ft_c_input_all_to_all(k_fp8)
-        v_fp8, v_descale = _per_tensor_quant_dynamic(value)
-        torch.maximum(fp8_comms.v_running_max, v_descale, out=fp8_comms.v_running_max)
-        value = _ft_c_input_all_to_all(v_fp8)
-    else:
-        q_fp8, q_descale = _per_tensor_quant(query, q_scale)
-        query = _ft_c_input_all_to_all(q_fp8)
-        k_fp8, k_descale = _per_tensor_quant(key, k_scale)
-        key = _ft_c_input_all_to_all(k_fp8)
-        v_fp8, v_descale = _per_tensor_quant(value, v_scale)
-        value = _ft_c_input_all_to_all(v_fp8)
+        torch.maximum(fp8_comms.q_running_max, query.abs().amax().unsqueeze(0), out=fp8_comms.q_running_max)
+    query = _ft_c_input_all_to_all(q_fp8)
+
+    k_fp8, k_descale = _per_tensor_quant(key, k_scale)
+    if fp8_comms.fixed_scale is None:
+        torch.maximum(fp8_comms.k_running_max, key.abs().amax().unsqueeze(0), out=fp8_comms.k_running_max)
+    key = _ft_c_input_all_to_all(k_fp8)
+
+    v_fp8, v_descale = _per_tensor_quant(value, v_scale)
+    if fp8_comms.fixed_scale is None:
+        torch.maximum(fp8_comms.v_running_max, value.abs().amax().unsqueeze(0), out=fp8_comms.v_running_max)
+    value = _ft_c_input_all_to_all(v_fp8)
 
     qkv_amaxes = (
         (q_descale.item(), k_descale.item(), v_descale.item())
