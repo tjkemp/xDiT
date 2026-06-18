@@ -111,6 +111,8 @@ def _per_tensor_quant(x: torch.Tensor, scale_t: torch.Tensor) -> tuple[torch.Ten
 _FP8_COMMS_SAFETY_FACTOR = 0.85  # leave 15% headroom above observed amax
 
 
+
+
 def _fp8_comms_input_all_to_all(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -174,18 +176,18 @@ def _fp8_comms_output_all_to_all(out: torch.Tensor, v_scale_t: torch.Tensor) -> 
 def _fp8_comms_finalize_calibration(device: torch.device):
     """All-reduce per-layer per-tensor amaxes and compute separate q/k/v scales per layer."""
     fp8_comms = get_runtime_state().fp8_comms
-    if not fp8_comms or not fp8_comms.layer_amaxes:
+    if fp8_comms is None or not isinstance(fp8_comms.layer_amaxes, torch.Tensor):
         return
     from xfuser.core.distributed.attention_backend import AITER_FP8_DTYPE
     dtype_max = torch.finfo(AITER_FP8_DTYPE).max
-    n_layers = len(fp8_comms.layer_amaxes)
-    # stack into (3, n_layers): rows are q, k, v; all_reduce for global max across Ulysses ranks
-    local = torch.tensor(fp8_comms.layer_amaxes, dtype=torch.float32, device=device).T  # (3, n_layers)
+    # layer_amaxes is (n_layers, 3) on cpu; move to device and transpose to (3, n_layers)
+    local = fp8_comms.layer_amaxes.to(device).T.contiguous()
     dist.all_reduce(local, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
     scales = local / (dtype_max * _FP8_COMMS_SAFETY_FACTOR)  # (3, n_layers)
-    fp8_comms.q_scales = [torch.tensor(scales[0, i].item(), dtype=torch.float32, device=device) for i in range(n_layers)]
-    fp8_comms.k_scales = [torch.tensor(scales[1, i].item(), dtype=torch.float32, device=device) for i in range(n_layers)]
-    fp8_comms.v_scales = [torch.tensor(scales[2, i].item(), dtype=torch.float32, device=device) for i in range(n_layers)]
+    n_layers = scales.shape[1]
+    fp8_comms.q_scales = [scales[0, i].clone() for i in range(n_layers)]
+    fp8_comms.k_scales = [scales[1, i].clone() for i in range(n_layers)]
+    fp8_comms.v_scales = [scales[2, i].clone() for i in range(n_layers)]
     fp8_comms.static = True
     fp8_comms.layer_amaxes = None
     if dist.get_rank() == 0:
@@ -383,9 +385,10 @@ def USP(
                 key = _ft_c_input_all_to_all(key)
                 v_amax_t = value.abs().amax()
                 value = _ft_c_input_all_to_all(value)
-                fp8_comms.layer_amaxes.append(
-                    (q_amax_t.item(), k_amax_t.item(), v_amax_t.item())
-                )
+                idx = fp8_comms.call_counter
+                fp8_comms.layer_amaxes[idx, 0] = q_amax_t
+                fp8_comms.layer_amaxes[idx, 1] = k_amax_t
+                fp8_comms.layer_amaxes[idx, 2] = v_amax_t
                 fp8_comms.call_counter += 1
             else:
                 query, key, value, attn_kwargs_update, qkv_scales, qkv_amaxes = _fp8_comms_input_all_to_all(query, key, value)

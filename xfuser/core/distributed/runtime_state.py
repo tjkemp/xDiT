@@ -68,13 +68,18 @@ class Fp8CommsState:
     layer_amaxes: Optional[list] = None   # [(q_amax, k_amax, v_amax), ...] during calibration
     call_counter: int = 0                 # layer index within a denoising step
 
+    def allocate_calibration(self, n_layers: int):
+        """Pre-allocate a fixed-size amax buffer to avoid recompilation during calibration."""
+        self.layer_amaxes = torch.zeros(n_layers, 3, dtype=torch.float32)
+
     def reset_calibration(self):
         """Reset to uncalibrated state for recalibration on next iteration."""
         self.q_scales = None
         self.k_scales = None
         self.v_scales = None
         self.static = False
-        self.layer_amaxes = []
+        if isinstance(self.layer_amaxes, torch.Tensor):
+            self.layer_amaxes.zero_()
         self.call_counter = 0
 
 
@@ -382,6 +387,11 @@ class DiTRuntimeState(RuntimeState):
         super().__init__(config)
         self.patch_mode = False
         self.pipeline_patch_idx = 0
+        if self.fp8_comms is not None and not self.fp8_comms.static:
+            n_layers = getattr(getattr(pipeline, "transformer", None), "config", None)
+            n_layers = getattr(n_layers, "num_layers", None) if n_layers else None
+            if n_layers is not None:
+                self.fp8_comms.allocate_calibration(n_layers)
         self._check_model_and_parallel_config(
             pipeline=pipeline, parallel_config=config.parallel_config
         )
