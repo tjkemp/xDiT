@@ -190,6 +190,20 @@ class RuntimeState(metaclass=ABCMeta):
             logger.warning("FP8 communication enabled with dynamic scaling (running max, synced per step).")
         self.fp8_comms = Fp8CommsState(fixed_scale=fixed_scale)
 
+    def reset_fp8_comms_calibration(self):
+        """Reset fp8_comms scales to safe defaults so the next step recalibrates."""
+        fp8_comms = self.fp8_comms
+        if fp8_comms is None or fp8_comms.fixed_scale is not None:
+            return
+        if not fp8_comms._on_device:
+            return
+        fp8_comms.q_scale.fill_(1.0)
+        fp8_comms.k_scale.fill_(1.0)
+        fp8_comms.v_scale.fill_(1.0)
+        fp8_comms.q_running_max.zero_()
+        fp8_comms.k_running_max.zero_()
+        fp8_comms.v_running_max.zero_()
+
     def sync_fp8_comms_running_max(self):
         """All-reduce running amaxes across Ulysses ranks and update scales in-place."""
         fp8_comms = self.fp8_comms
