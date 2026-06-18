@@ -195,11 +195,13 @@ class RuntimeState(metaclass=ABCMeta):
         fp8_comms = self.fp8_comms
         if fp8_comms is None or fp8_comms.fixed_scale is not None or not fp8_comms._on_device:
             return
+        if fp8_comms.q_running_max.item() == 0.0:
+            return  # no attention calls happened this step, keep existing scales
         from xfuser.core.distributed.attention_backend import AITER_FP8_DTYPE
         dtype_max = torch.finfo(AITER_FP8_DTYPE).max
         maxes = torch.cat([fp8_comms.q_running_max, fp8_comms.k_running_max, fp8_comms.v_running_max])
         dist.all_reduce(maxes, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
-        scales = maxes / (dtype_max * _FP8_COMMS_SAFETY_FACTOR)
+        scales = maxes.clamp(min=1e-6) / (dtype_max * _FP8_COMMS_SAFETY_FACTOR)
         fp8_comms.q_scale.copy_(scales[0:1])
         fp8_comms.k_scale.copy_(scales[1:2])
         fp8_comms.v_scale.copy_(scales[2:3])
