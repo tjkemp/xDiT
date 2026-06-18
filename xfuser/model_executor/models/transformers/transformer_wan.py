@@ -124,7 +124,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         runtime_state = get_runtime_state()
         use_fp8_comms = (
             not self.is_cross_attention
-            and (runtime_state.fp8_comms_calibrated or runtime_state.fp8_comms_layer_amaxes is not None)
+            and runtime_state.fp8_comms is not None
             and runtime_state.attention_backend in SUPPORTS_PRE_QUANTIZATION_BACKENDS
         )
 

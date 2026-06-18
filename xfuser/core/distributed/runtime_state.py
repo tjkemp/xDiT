@@ -2,6 +2,7 @@ from abc import ABCMeta
 import inspect
 import random
 from typing import List, Optional
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -57,13 +58,30 @@ def set_random_seed(seed: int):
     device_manual_seed_all(seed)
 
 
+@dataclass
+class Fp8CommsState:
+    """Holds all state for FP8 Ulysses all-to-all communication."""
+    q_scales: Optional[list] = None       # per-layer q scale tensors, None until static
+    k_scales: Optional[list] = None       # per-layer k scale tensors, None until static
+    v_scales: Optional[list] = None       # per-layer v scale tensors, None until static
+    static: bool = False                  # True = scales ready to use (calibrated or fixed)
+    layer_amaxes: Optional[list] = None   # [(q_amax, k_amax, v_amax), ...] during calibration
+    call_counter: int = 0                 # layer index within a denoising step
+
+    def reset_calibration(self):
+        """Reset to uncalibrated state for recalibration on next iteration."""
+        self.q_scales = None
+        self.k_scales = None
+        self.v_scales = None
+        self.static = False
+        self.layer_amaxes = []
+        self.call_counter = 0
+
+
 class RuntimeState(metaclass=ABCMeta):
     attention_backend: AttentionBackendType = AttentionBackendType.SDPA_FLASH
     cross_attention_backend: Optional[AttentionBackendType] = None
-    fp8_comms_scale: Optional[float] = None
-    fp8_comms_scale_tensor: Optional[torch.Tensor] = None
-    fp8_comms_calibrated: bool = False
-    fp8_comms_layer_amaxes: list = None
+    fp8_comms: Optional[Fp8CommsState] = None        # None = disabled
     parallel_config: ParallelConfig
     runtime_config: RuntimeConfig
     input_config: InputConfig
@@ -136,9 +154,7 @@ class RuntimeState(metaclass=ABCMeta):
 
     def _init_fp8_comms(self, config: EngineConfig):
         if not config.runtime_config.use_fp8_comms:
-            self.fp8_comms_scale = None
-            self.fp8_comms_calibrated = False
-            self.fp8_comms_layer_amaxes = None
+            self.fp8_comms = None
             return
         ulysses_degree = config.parallel_config.sp_config.ulysses_degree or 1
         if ulysses_degree <= 1:
@@ -146,33 +162,27 @@ class RuntimeState(metaclass=ABCMeta):
                 "--use_fp8_comms is set but ulysses_degree <= 1. "
                 "FP8 communication will not be applied."
             )
-            self.fp8_comms_scale = None
-            self.fp8_comms_calibrated = False
-            self.fp8_comms_layer_amaxes = None
+            self.fp8_comms = None
+            return
+        fixed_scale = config.runtime_config.fp8_comms_scale
+        if fixed_scale is not None:
+            logger.warning(f"FP8 communication enabled with fixed scale {fixed_scale} for all layers.")
+            self.fp8_comms = Fp8CommsState(static=True)
+            # scale tensors created lazily on first forward pass when device is known
+            self.fp8_comms._fixed_scale = fixed_scale
         else:
-            fixed_scale = config.runtime_config.fp8_comms_scale
-            if fixed_scale is not None:
-                logger.warning(f"FP8 communication enabled with fixed scale {fixed_scale}.")
-                self.fp8_comms_scale = fixed_scale
-                self.fp8_comms_calibrated = True   # fixed scale, skip calibration
-                self.fp8_comms_layer_amaxes = None
-            else:
-                logger.warning("FP8 communication enabled. Will calibrate scale on first iteration.")
-                self.fp8_comms_scale = None
-                self.fp8_comms_calibrated = False
-                self.fp8_comms_layer_amaxes = []
-            self.fp8_comms_scale_tensor = None
+            logger.warning("FP8 communication enabled. Will calibrate per-layer per-tensor scales on first iteration.")
+            self.fp8_comms = Fp8CommsState(layer_amaxes=[])
 
     def reset_fp8_comms_calibration(self):
-        """Reset calibration state so the next iteration re-calibrates the FP8 scale."""
-        if self.fp8_comms_layer_amaxes is not None or not self.fp8_comms_calibrated:
-            return  # already uncalibrated or fixed scale
-        if self.fp8_comms_scale_tensor is not None:
-            # only reset if we're using dynamic calibration, not a fixed scale
-            self.fp8_comms_scale = None
-            self.fp8_comms_scale_tensor = None
-            self.fp8_comms_calibrated = False
-            self.fp8_comms_layer_amaxes = []
+        """Reset to uncalibrated state so the next generation recalibrates per-layer scales."""
+        if self.fp8_comms is None:
+            return
+        if not self.fp8_comms.static:
+            return  # already uncalibrated
+        if hasattr(self.fp8_comms, '_fixed_scale'):
+            return  # fixed scale override, never recalibrate
+        self.fp8_comms.reset_calibration()
 
     def set_cross_attention_backend(self, cross_attention_backend: Optional[str | AttentionBackendType]):
         """
@@ -456,9 +466,11 @@ class DiTRuntimeState(RuntimeState):
             self.use_high_precision_gemm = self.gemm_schedule.is_high_precision(current_step)
 
         self.step_counter = self.step_counter + 1
+        if self.fp8_comms is not None:
+            self.fp8_comms.call_counter = 0  # reset layer index at each new denoising step
 
         # finalize calibration after the first iteration
-        if self.step_counter == 1 and self.fp8_comms_layer_amaxes is not None and not self.fp8_comms_calibrated:
+        if self.step_counter == 1 and self.fp8_comms is not None and not self.fp8_comms.static and self.fp8_comms.layer_amaxes:
             from xfuser.model_executor.layers.usp import _fp8_comms_finalize_calibration
             _fp8_comms_finalize_calibration(torch.device("cuda", torch.cuda.current_device()))
 

@@ -272,6 +272,23 @@ class xFuserModel(abc.ABC):
             self.pipe.enable_model_cpu_offload()
 
 
+    def _validate_fp8_comms_config(self, config: xFuserArgs) -> None:
+        if not self.capabilities.use_fp8_comms:
+            raise ValueError(f"Model {self.settings.model_name} does not support --use_fp8_comms.")
+        if (config.ulysses_degree or 1) <= 1:
+            raise ValueError("--use_fp8_comms requires ulysses_degree > 1.")
+        effective_backends = set()
+        if config.attention_backend:
+            effective_backends.add(_parse_attention_backend(config.attention_backend, "attention backend"))
+        if config.use_hybrid_attn_schedule and config.hybrid_attn_low_precision_backend:
+            effective_backends.add(_parse_attention_backend(config.hybrid_attn_low_precision_backend, "hybrid low-precision attention backend"))
+        if not effective_backends & SUPPORTS_PRE_QUANTIZATION_BACKENDS:
+            raise ValueError(
+                f"--use_fp8_comms requires an attention backend that supports pre-quantization "
+                f"({', '.join(b.name for b in SUPPORTS_PRE_QUANTIZATION_BACKENDS)}). "
+                f"Set --attention_backend or --hybrid_attn_low_precision_backend accordingly."
+            )
+
     def _validate_config(self, config: xFuserArgs) -> None:
         """ Validate if the model supports requested config """
         for key in ModelCapabilities.__annotations__.keys():
@@ -342,21 +359,7 @@ class xFuserModel(abc.ABC):
             raise ValueError(f"Dataset path specified without batch size. Please specify batch size for dataset inference.")
 
         if config.use_fp8_comms:
-            if not self.capabilities.use_fp8_comms:
-                raise ValueError(f"Model {self.settings.model_name} does not support --use_fp8_comms.")
-            if (config.ulysses_degree or 1) <= 1:
-                raise ValueError("--use_fp8_comms requires ulysses_degree > 1.")
-            effective_backends = set()
-            if config.attention_backend:
-                effective_backends.add(_parse_attention_backend(config.attention_backend, "attention backend"))
-            if config.use_hybrid_attn_schedule and config.hybrid_attn_low_precision_backend:
-                effective_backends.add(_parse_attention_backend(config.hybrid_attn_low_precision_backend, "hybrid low-precision attention backend"))
-            if not effective_backends & SUPPORTS_PRE_QUANTIZATION_BACKENDS:
-                raise ValueError(
-                    f"--use_fp8_comms requires an attention backend that supports pre-quantization "
-                    f"({', '.join(b.name for b in SUPPORTS_PRE_QUANTIZATION_BACKENDS)}). "
-                    f"Set --attention_backend or --hybrid_attn_low_precision_backend accordingly."
-                )
+            self._validate_fp8_comms_config(config)
 
         if self.model_output_type == "video" and not self.fps:
             raise ValueError(f"Model {self.settings.model_name} produces video output but fps is not set.")
