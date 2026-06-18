@@ -121,10 +121,11 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             query = apply_rotary_emb(query, *rotary_emb)
             key = apply_rotary_emb(key, *rotary_emb)
 
+        runtime_state = get_runtime_state()
         use_fp8_comms = (
             not self.is_cross_attention
-            and get_runtime_state().fp8_comms_scale is not None
-            and get_runtime_state().attention_backend in SUPPORTS_PRE_QUANTIZATION_BACKENDS
+            and (runtime_state.fp8_comms_calibrated or runtime_state.fp8_comms_layer_amaxes is not None)
+            and runtime_state.attention_backend in SUPPORTS_PRE_QUANTIZATION_BACKENDS
         )
 
         # I2V task
