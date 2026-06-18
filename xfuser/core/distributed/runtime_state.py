@@ -62,6 +62,8 @@ class RuntimeState(metaclass=ABCMeta):
     cross_attention_backend: Optional[AttentionBackendType] = None
     fp8_comms_scale: Optional[float] = None
     fp8_comms_scale_tensor: Optional[torch.Tensor] = None
+    fp8_comms_calibrated: bool = False
+    fp8_comms_layer_amaxes: list = None
     parallel_config: ParallelConfig
     runtime_config: RuntimeConfig
     input_config: InputConfig
@@ -135,6 +137,8 @@ class RuntimeState(metaclass=ABCMeta):
     def _init_fp8_comms(self, config: EngineConfig):
         if not config.runtime_config.use_fp8_comms:
             self.fp8_comms_scale = None
+            self.fp8_comms_calibrated = False
+            self.fp8_comms_layer_amaxes = None
             return
         ulysses_degree = config.parallel_config.sp_config.ulysses_degree or 1
         if ulysses_degree <= 1:
@@ -143,11 +147,32 @@ class RuntimeState(metaclass=ABCMeta):
                 "FP8 communication will not be applied."
             )
             self.fp8_comms_scale = None
+            self.fp8_comms_calibrated = False
+            self.fp8_comms_layer_amaxes = None
         else:
-            scale = config.runtime_config.fp8_comms_scale
-            logger.warning(f"FP8 communication enabled with scale {scale}.")
-            self.fp8_comms_scale = scale
-            self.fp8_comms_scale_tensor = None  # created on first forward pass when device is known
+            fixed_scale = config.runtime_config.fp8_comms_scale
+            if fixed_scale is not None:
+                logger.warning(f"FP8 communication enabled with fixed scale {fixed_scale}.")
+                self.fp8_comms_scale = fixed_scale
+                self.fp8_comms_calibrated = True   # fixed scale, skip calibration
+                self.fp8_comms_layer_amaxes = None
+            else:
+                logger.warning("FP8 communication enabled. Will calibrate scale on first iteration.")
+                self.fp8_comms_scale = None
+                self.fp8_comms_calibrated = False
+                self.fp8_comms_layer_amaxes = []
+            self.fp8_comms_scale_tensor = None
+
+    def reset_fp8_comms_calibration(self):
+        """Reset calibration state so the next iteration re-calibrates the FP8 scale."""
+        if self.fp8_comms_layer_amaxes is not None or not self.fp8_comms_calibrated:
+            return  # already uncalibrated or fixed scale
+        if self.fp8_comms_scale_tensor is not None:
+            # only reset if we're using dynamic calibration, not a fixed scale
+            self.fp8_comms_scale = None
+            self.fp8_comms_scale_tensor = None
+            self.fp8_comms_calibrated = False
+            self.fp8_comms_layer_amaxes = []
 
     def set_cross_attention_backend(self, cross_attention_backend: Optional[str | AttentionBackendType]):
         """
@@ -431,8 +456,15 @@ class DiTRuntimeState(RuntimeState):
             self.use_high_precision_gemm = self.gemm_schedule.is_high_precision(current_step)
 
         self.step_counter = self.step_counter + 1
+
+        # finalize calibration after the first iteration
+        if self.step_counter == 1 and self.fp8_comms_layer_amaxes is not None and not self.fp8_comms_calibrated:
+            from xfuser.model_executor.layers.usp import _fp8_comms_finalize_calibration
+            _fp8_comms_finalize_calibration(torch.device("cuda", torch.cuda.current_device()))
+
         if self.step_counter >= active_total_steps:
             self.step_counter = 0
+            self.reset_fp8_comms_calibration()
 
     def set_attention_schedule(
         self,

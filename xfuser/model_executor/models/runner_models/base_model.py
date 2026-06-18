@@ -120,7 +120,6 @@ class ModelCapabilities:
     use_fp8_gemms: bool = False
     use_fp4_gemms: bool = False
     use_fp8_comms: bool = False
-    fp8_comms_default_scale: Optional[float] = None
     use_fbcache: bool = False
     use_hybrid_attn_schedule: bool = False
     use_hybrid_gemm_schedule: bool = False
@@ -358,13 +357,6 @@ class xFuserModel(abc.ABC):
                     f"({', '.join(b.name for b in SUPPORTS_PRE_QUANTIZATION_BACKENDS)}). "
                     f"Set --attention_backend or --hybrid_attn_low_precision_backend accordingly."
                 )
-            if self.capabilities.fp8_comms_default_scale is None and config.fp8_comms_scale is None:
-                raise ValueError(
-                    f"--use_fp8_comms is enabled but model {self.settings.model_name} has no default "
-                    f"FP8 communication scale. Pass --fp8_comms_scale to set one explicitly."
-                )
-            if config.fp8_comms_scale is None:
-                config.fp8_comms_scale = self.capabilities.fp8_comms_default_scale
 
         if self.model_output_type == "video" and not self.fps:
             raise ValueError(f"Model {self.settings.model_name} produces video output but fps is not set.")

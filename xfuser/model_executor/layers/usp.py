@@ -147,6 +147,30 @@ def _fp8_comms_input_all_to_all(
 
 
 
+_FP8_COMMS_SAFETY_FACTOR = 0.85  # leave 15% headroom above observed amax
+
+
+
+def _fp8_comms_finalize_calibration(device: torch.device):
+    """All-reduce collected amaxes across Ulysses ranks and compute the scale."""
+    runtime_state = get_runtime_state()
+    if not runtime_state.fp8_comms_layer_amaxes:
+        return
+    # AITER_FP8_DTYPE is set at module load from aiter if available, falls back to float8_e4m3fn.
+    # Both have the same max value (448) so the fallback is safe.
+    from xfuser.core.distributed.attention_backend import AITER_FP8_DTYPE
+    dtype_max = torch.finfo(AITER_FP8_DTYPE).max
+    local_max = torch.tensor(max(runtime_state.fp8_comms_layer_amaxes), dtype=torch.float32, device=device)
+    dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
+    scale = local_max.item() / (dtype_max * _FP8_COMMS_SAFETY_FACTOR)
+    runtime_state.fp8_comms_scale = scale
+    runtime_state.fp8_comms_scale_tensor = torch.tensor(scale, dtype=torch.float32, device=device)
+    runtime_state.fp8_comms_calibrated = True
+    runtime_state.fp8_comms_layer_amaxes = None
+    if dist.get_rank() == 0:
+        print(f"[fp8_comms] calibration complete: observed_max={local_max.item():.4f} scale={scale:.6f}")
+
+
 def _combined_qkv_all_to_all(q, k, v):
     """Concatenate query, key, value tensors and perform a single all-to-all communication."""
     world_size = get_ulysses_parallel_world_size()
@@ -325,10 +349,23 @@ def USP(
 
     scale_t = None
     qkv_amaxes = None
+    _calibrating = False
     if get_ulysses_parallel_world_size() > 1:
         if use_fp8_comms:
-            query, key, value, attn_kwargs_update, scale_t, qkv_amaxes = _fp8_comms_input_all_to_all(query, key, value)
-            attention_kwargs = (attention_kwargs or {}) | attn_kwargs_update
+            runtime_state = get_runtime_state()
+            if not runtime_state.fp8_comms_calibrated:
+                # calibration iteration: collect amaxes on original tensors (before redistribution),
+                # then launch BF16 all-to-alls. The amax computation runs while the first
+                # all-to-all is in flight.
+                _calibrating = True
+                amax = max(query.abs().amax().item(), key.abs().amax().item(), value.abs().amax().item())
+                query = _ft_c_input_all_to_all(query)
+                key = _ft_c_input_all_to_all(key)
+                value = _ft_c_input_all_to_all(value)
+                runtime_state.fp8_comms_layer_amaxes.append(amax)
+            else:
+                query, key, value, attn_kwargs_update, scale_t, qkv_amaxes = _fp8_comms_input_all_to_all(query, key, value)
+                attention_kwargs = (attention_kwargs or {}) | attn_kwargs_update
         elif combine_qkv_a2a and query.shape == key.shape == value.shape:
             query, key, value = _combined_qkv_all_to_all(query, key, value)
         else:
@@ -376,7 +413,7 @@ def USP(
                             is_causal=is_causal,
                             joint_attn_kwargs=joint_attn_kwargs,
                             attention_kwargs=attention_kwargs)
-        if use_fp8_comms:
+        if use_fp8_comms and not _calibrating:
             if _FP8_LOG_SCALES and qkv_amaxes is not None:
                 out_amax = out.abs().amax().item()
                 rank = dist.get_rank()
