@@ -213,8 +213,6 @@ class RuntimeState(metaclass=ABCMeta):
             return
         if fp8_comms.synced:
             return  # scales already frozen after first sync
-        if fp8_comms.q_running_max.item() == 0.0:
-            return  # no attention calls happened this step, keep existing scales
         from xfuser.core.distributed.attention_backend import AITER_FP8_DTYPE
         dtype_max = torch.finfo(AITER_FP8_DTYPE).max
         maxes = torch.cat([fp8_comms.q_running_max, fp8_comms.k_running_max, fp8_comms.v_running_max])
