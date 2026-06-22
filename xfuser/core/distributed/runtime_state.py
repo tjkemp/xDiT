@@ -232,8 +232,6 @@ class RuntimeState(metaclass=ABCMeta):
         fp8_comms.k_running_max.zero_()
         fp8_comms.v_running_max.zero_()
         fp8_comms.synced = True
-        if dist.get_rank() == 0:
-            print(f"[fp8_comms] scales synced: q={scales[0].item():.6f} k={scales[1].item():.6f} v={scales[2].item():.6f}")
 
     def set_cross_attention_backend(self, cross_attention_backend: Optional[str | AttentionBackendType]):
         """
