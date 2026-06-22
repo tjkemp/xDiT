@@ -109,39 +109,25 @@ def _per_tensor_quant(x: torch.Tensor, scale_t: torch.Tensor) -> tuple[torch.Ten
 
 
 
-def _fp8_comms_ensure_on_device(fp8_comms, device: torch.device):
-    """Move fp8_comms tensors to GPU on first forward pass."""
-    fp8_comms.to_device_(device)
-
-
 def _fp8_comms_input_all_to_all(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
 ) -> tuple:
-    """Quantize Q/K/V to FP8 using dynamic running max scales and run interleaved input all-to-alls.
+    """Quantize Q/K/V to FP8 using shared scales and run interleaved input all-to-alls.
 
-    Scales are updated in-place each call and synced across Ulysses ranks once per denoising step.
+    Scales start at 1.0 and are updated once per generation via all_reduce after step 1.
     Returns (query, key, value, attn_kwargs_update, (q_scale, k_scale, v_scale), qkv_amaxes).
     """
     fp8_comms = get_runtime_state().fp8_comms
-    _fp8_comms_ensure_on_device(fp8_comms, query.device)
     q_scale, k_scale, v_scale = fp8_comms.q_scale, fp8_comms.k_scale, fp8_comms.v_scale
 
-    # always quantize with shared synced scale so all ranks agree on encoding
+    # quantize with shared synced scale so all ranks agree on encoding, then all-to-all
     q_fp8, q_descale = _per_tensor_quant(query, q_scale)
-    if fp8_comms.fixed_scale is None and not fp8_comms.synced:
-        torch.maximum(fp8_comms.q_running_max, query.abs().amax().unsqueeze(0), out=fp8_comms.q_running_max)
     query = _ft_c_input_all_to_all(q_fp8)
-
     k_fp8, k_descale = _per_tensor_quant(key, k_scale)
-    if fp8_comms.fixed_scale is None and not fp8_comms.synced:
-        torch.maximum(fp8_comms.k_running_max, key.abs().amax().unsqueeze(0), out=fp8_comms.k_running_max)
     key = _ft_c_input_all_to_all(k_fp8)
-
     v_fp8, v_descale = _per_tensor_quant(value, v_scale)
-    if fp8_comms.fixed_scale is None and not fp8_comms.synced:
-        torch.maximum(fp8_comms.v_running_max, value.abs().amax().unsqueeze(0), out=fp8_comms.v_running_max)
     value = _ft_c_input_all_to_all(v_fp8)
 
     qkv_amaxes = (

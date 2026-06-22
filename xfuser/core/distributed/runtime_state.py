@@ -2,7 +2,6 @@ from abc import ABCMeta
 import inspect
 import random
 from typing import List, Optional
-from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -85,6 +84,14 @@ class Fp8CommsState:
         self.v_running_max = torch.zeros(1, dtype=torch.float32)
         self.synced = False   # True after first all_reduce; scales frozen, no more tracking
         self._on_device = False
+
+    def update_running_max(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        """Update per-tensor running amaxes from Q/K/V. No-op when fixed scale or already synced."""
+        if self.fixed_scale is not None or self.synced:
+            return
+        torch.maximum(self.q_running_max, q.abs().amax().unsqueeze(0), out=self.q_running_max)
+        torch.maximum(self.k_running_max, k.abs().amax().unsqueeze(0), out=self.k_running_max)
+        torch.maximum(self.v_running_max, v.abs().amax().unsqueeze(0), out=self.v_running_max)
 
     def to_device_(self, device: torch.device):
         if self._on_device:
