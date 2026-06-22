@@ -436,6 +436,8 @@ class DiTRuntimeState(RuntimeState):
         except Exception:
             # Keeps backward compatatability with existing pipeline classes.
             pass
+        if self.fp8_comms is not None and torch.cuda.is_available():
+            self.fp8_comms.to_device_(torch.device("cuda", torch.cuda.current_device()))
 
     def _check_pipeline_class_name(self, pipeline: DiffusionPipeline, config: EngineConfig):
         self.cogvideox = False
