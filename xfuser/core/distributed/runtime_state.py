@@ -83,6 +83,7 @@ class Fp8CommsState:
         self.q_running_max = torch.zeros(1, dtype=torch.float32)
         self.k_running_max = torch.zeros(1, dtype=torch.float32)
         self.v_running_max = torch.zeros(1, dtype=torch.float32)
+        self.synced = False   # True after first all_reduce; scales frozen, no more tracking
         self._on_device = False
 
     def to_device_(self, device: torch.device):
@@ -203,12 +204,15 @@ class RuntimeState(metaclass=ABCMeta):
         fp8_comms.q_running_max.zero_()
         fp8_comms.k_running_max.zero_()
         fp8_comms.v_running_max.zero_()
+        fp8_comms.synced = False
 
     def sync_fp8_comms_running_max(self):
         """All-reduce running amaxes across Ulysses ranks and update scales in-place."""
         fp8_comms = self.fp8_comms
         if fp8_comms is None or fp8_comms.fixed_scale is not None or not fp8_comms._on_device:
             return
+        if fp8_comms.synced:
+            return  # scales already frozen after first sync
         if fp8_comms.q_running_max.item() == 0.0:
             return  # no attention calls happened this step, keep existing scales
         from xfuser.core.distributed.attention_backend import AITER_FP8_DTYPE
@@ -222,6 +226,9 @@ class RuntimeState(metaclass=ABCMeta):
         fp8_comms.q_running_max.zero_()
         fp8_comms.k_running_max.zero_()
         fp8_comms.v_running_max.zero_()
+        fp8_comms.synced = True
+        if dist.get_rank() == 0:
+            print(f"[fp8_comms] scales synced: q={scales[0].item():.6f} k={scales[1].item():.6f} v={scales[2].item():.6f}")
 
     def set_cross_attention_backend(self, cross_attention_backend: Optional[str | AttentionBackendType]):
         """

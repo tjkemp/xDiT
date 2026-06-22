@@ -130,17 +130,17 @@ def _fp8_comms_input_all_to_all(
 
     # always quantize with shared synced scale so all ranks agree on encoding
     q_fp8, q_descale = _per_tensor_quant(query, q_scale)
-    if fp8_comms.fixed_scale is None:
+    if fp8_comms.fixed_scale is None and not fp8_comms.synced:
         torch.maximum(fp8_comms.q_running_max, query.abs().amax().unsqueeze(0), out=fp8_comms.q_running_max)
     query = _ft_c_input_all_to_all(q_fp8)
 
     k_fp8, k_descale = _per_tensor_quant(key, k_scale)
-    if fp8_comms.fixed_scale is None:
+    if fp8_comms.fixed_scale is None and not fp8_comms.synced:
         torch.maximum(fp8_comms.k_running_max, key.abs().amax().unsqueeze(0), out=fp8_comms.k_running_max)
     key = _ft_c_input_all_to_all(k_fp8)
 
     v_fp8, v_descale = _per_tensor_quant(value, v_scale)
-    if fp8_comms.fixed_scale is None:
+    if fp8_comms.fixed_scale is None and not fp8_comms.synced:
         torch.maximum(fp8_comms.v_running_max, value.abs().amax().unsqueeze(0), out=fp8_comms.v_running_max)
     value = _ft_c_input_all_to_all(v_fp8)
 
