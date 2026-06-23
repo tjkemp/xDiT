@@ -128,7 +128,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             and runtime_state.attention_backend in SUPPORTS_PRE_QUANTIZATION_BACKENDS
         )
 
-        # collect amaxes for dynamic scale calibration on all steps, not just FP8 ones
+        # update running max for dynamic scale calibration -- pure in-place tensor ops, no graph break
         if not self.is_cross_attention and runtime_state.fp8_comms is not None:
             runtime_state.fp8_comms.update_running_max(query, key, value)
 

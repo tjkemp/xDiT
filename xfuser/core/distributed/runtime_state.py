@@ -55,7 +55,6 @@ logger = init_logger(__name__)
 
 env_info = PACKAGES_CHECKER.get_packages_info()
 
-_FP8_COMMS_SAFETY_FACTOR = 0.85  # leave 15% headroom above observed amax when computing scale
 
 def set_random_seed(seed: int):
     random.seed(seed)
@@ -68,41 +67,35 @@ def set_random_seed(seed: int):
 class Fp8CommsState:
     """Holds all state for FP8 Ulysses all-to-all communication.
 
-    All tensors are pre-allocated on CPU and moved to GPU on first forward pass.
-    No None checks after initialization -- guards are stable for torch.compile.
-    Scales are updated via copy_() so object identity never changes.
+    All tensors are pre-allocated on CPU and moved to GPU in DiTRuntimeState.__init__
+    so no device copies occur inside the compiled region.
     """
     def __init__(self, fixed_scale: Optional[float] = None):
         self.fixed_scale = fixed_scale
-        # pre-allocate on CPU; moved to device on first forward pass via to_()
-        init = float(fixed_scale) if fixed_scale is not None else 1.0
-        self.q_scale = torch.tensor([init], dtype=torch.float32)
-        self.k_scale = torch.tensor([init], dtype=torch.float32)
-        self.v_scale = torch.tensor([init], dtype=torch.float32)
+        s = float(fixed_scale) if fixed_scale is not None else 1.0
+        self.q_scale = torch.tensor([s], dtype=torch.float32)
+        self.k_scale = torch.tensor([s], dtype=torch.float32)
+        self.v_scale = torch.tensor([s], dtype=torch.float32)
         self.q_running_max = torch.zeros(1, dtype=torch.float32)
         self.k_running_max = torch.zeros(1, dtype=torch.float32)
         self.v_running_max = torch.zeros(1, dtype=torch.float32)
-        self.synced = False   # True after first all_reduce; scales frozen, no more tracking
-        self._on_device = False
+        self.synced = fixed_scale is not None  # fixed scale needs no sync
 
     def update_running_max(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        """Update per-tensor running amaxes from Q/K/V. No-op when fixed scale or already synced."""
-        if self.fixed_scale is not None or self.synced:
+        """Update running amaxes in-place. Safe inside compiled region -- pure tensor ops."""
+        if self.synced:
             return
         torch.maximum(self.q_running_max, q.abs().amax().unsqueeze(0), out=self.q_running_max)
         torch.maximum(self.k_running_max, k.abs().amax().unsqueeze(0), out=self.k_running_max)
         torch.maximum(self.v_running_max, v.abs().amax().unsqueeze(0), out=self.v_running_max)
 
     def to_device_(self, device: torch.device):
-        if self._on_device:
-            return
         self.q_scale = self.q_scale.to(device)
         self.k_scale = self.k_scale.to(device)
         self.v_scale = self.v_scale.to(device)
         self.q_running_max = self.q_running_max.to(device)
         self.k_running_max = self.k_running_max.to(device)
         self.v_running_max = self.v_running_max.to(device)
-        self._on_device = True
 
 
 class RuntimeState(metaclass=ABCMeta):
@@ -191,36 +184,17 @@ class RuntimeState(metaclass=ABCMeta):
             )
             self.fp8_comms = None
             return
-        fixed_scale = config.runtime_config.fp8_comms_scale
-        if fixed_scale is not None:
-            logger.warning(f"FP8 communication enabled with fixed scale {fixed_scale}.")
-        else:
-            logger.warning("FP8 communication enabled with dynamic scaling (running max, synced per step).")
-        self.fp8_comms = Fp8CommsState(fixed_scale=fixed_scale)
+        scale = config.runtime_config.fp8_comms_scale
+        logger.warning(f"FP8 communication enabled with scale {scale}.")
+        self.fp8_comms = Fp8CommsState(fixed_scale=scale)
 
-    def reset_fp8_comms_calibration(self):
-        """Reset fp8_comms scales to safe defaults so the next step recalibrates."""
+    def sync_fp8_comms(self):
+        """All-reduce running amaxes and update scales. Call from pipeline loop (outside compiled region)."""
         fp8_comms = self.fp8_comms
-        if fp8_comms is None or fp8_comms.fixed_scale is not None:
+        if fp8_comms is None or fp8_comms.fixed_scale is not None or fp8_comms.synced:
             return
-        if not fp8_comms._on_device:
-            return
-        fp8_comms.q_scale.fill_(1.0)
-        fp8_comms.k_scale.fill_(1.0)
-        fp8_comms.v_scale.fill_(1.0)
-        fp8_comms.q_running_max.zero_()
-        fp8_comms.k_running_max.zero_()
-        fp8_comms.v_running_max.zero_()
-        fp8_comms.synced = False
-
-    def sync_fp8_comms_running_max(self):
-        """All-reduce running amaxes across Ulysses ranks and update scales in-place."""
-        fp8_comms = self.fp8_comms
-        if fp8_comms is None or fp8_comms.fixed_scale is not None or not fp8_comms._on_device:
-            return
-        if fp8_comms.synced:
-            return  # scales already frozen after first sync
         from xfuser.core.distributed.attention_backend import AITER_FP8_DTYPE
+        _FP8_COMMS_SAFETY_FACTOR = 0.85
         dtype_max = torch.finfo(AITER_FP8_DTYPE).max
         maxes = torch.cat([fp8_comms.q_running_max, fp8_comms.k_running_max, fp8_comms.v_running_max])
         dist.all_reduce(maxes, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
@@ -232,6 +206,19 @@ class RuntimeState(metaclass=ABCMeta):
         fp8_comms.k_running_max.zero_()
         fp8_comms.v_running_max.zero_()
         fp8_comms.synced = True
+
+    def reset_fp8_comms_calibration(self):
+        """Reset scales to 1.0 for recalibration (e.g. on transformer switch). Call from pipeline loop."""
+        fp8_comms = self.fp8_comms
+        if fp8_comms is None or fp8_comms.fixed_scale is not None:
+            return
+        fp8_comms.q_scale.fill_(1.0)
+        fp8_comms.k_scale.fill_(1.0)
+        fp8_comms.v_scale.fill_(1.0)
+        fp8_comms.q_running_max.zero_()
+        fp8_comms.k_running_max.zero_()
+        fp8_comms.v_running_max.zero_()
+        fp8_comms.synced = False
 
     def set_cross_attention_backend(self, cross_attention_backend: Optional[str | AttentionBackendType]):
         """
@@ -517,10 +504,6 @@ class DiTRuntimeState(RuntimeState):
             self.use_high_precision_gemm = self.gemm_schedule.is_high_precision(current_step)
 
         self.step_counter = self.step_counter + 1
-
-        # sync after step 0 completes (step_counter just became 1)
-        if self.step_counter == 1:
-            self.sync_fp8_comms_running_max()
 
         if self.step_counter >= active_total_steps:
             self.step_counter = 0
