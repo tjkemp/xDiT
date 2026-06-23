@@ -517,7 +517,10 @@ class DiTRuntimeState(RuntimeState):
             self.use_high_precision_gemm = self.gemm_schedule.is_high_precision(current_step)
 
         self.step_counter = self.step_counter + 1
-        self.sync_fp8_comms_running_max()
+
+        # sync after step 0 completes (step_counter just became 1)
+        if self.step_counter == 1:
+            self.sync_fp8_comms_running_max()
 
         if self.step_counter >= active_total_steps:
             self.step_counter = 0
