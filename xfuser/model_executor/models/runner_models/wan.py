@@ -12,6 +12,7 @@ from safetensors.torch import load_file
 from xfuser import xFuserArgs
 from xfuser.model_executor.models.transformers.transformer_wan import xFuserWanTransformer3DWrapper
 from xfuser.model_executor.models.transformers.transformer_wan_vace import xFuserWanVACETransformer3DWrapper
+from xfuser.model_executor.pipelines.pipeline_wan_t2v import xFuserWanT2VPipeline
 from xfuser.model_executor.pipelines.pipeline_wan_i2v import (
     xFuserWanImageToVideoPipeline,
 )
@@ -516,7 +517,7 @@ class xFuserWan21T2VModel(xFuserModel):
             subfolder="transformer",
             attention_kwargs=_build_attention_kwargs(self.config),
         )
-        pipe = WanPipeline.from_pretrained(
+        pipe = xFuserWanT2VPipeline.from_pretrained(
             pretrained_model_name_or_path=self.settings.model_name,
             torch_dtype=torch.bfloat16,
             transformer=transformer,
@@ -590,7 +591,7 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
             subfolder="transformer_2",
             attention_kwargs=_build_attention_kwargs(self.config),
         )
-        pipe = WanPipeline.from_pretrained(
+        pipe = xFuserWanT2VPipeline.from_pretrained(
             pretrained_model_name_or_path=self.settings.model_name,
             torch_dtype=torch.bfloat16,
             transformer=transformer,
@@ -658,7 +659,7 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
             subfolder="transformer",
             attention_kwargs=_build_attention_kwargs(self.config),
         )
-        pipe_class = xFuserWanImageToVideoPipeline if self.config.task == "i2v" else WanPipeline
+        pipe_class = xFuserWanImageToVideoPipeline if self.config.task == "i2v" else xFuserWanT2VPipeline
         pipe = pipe_class.from_pretrained(
                 pretrained_model_name_or_path=self.settings.model_name,
                 torch_dtype=torch.bfloat16,

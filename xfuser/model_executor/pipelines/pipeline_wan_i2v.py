@@ -191,7 +191,7 @@ class xFuserWanImageToVideoPipeline(WanImageToVideoPipeline):
                 else:
                     # low-noise stage in wan2.2 -- reset calibration on first switch to transformer_2
                     if current_model is not self.transformer_2:
-                        get_runtime_state().reset_fp8_comms_calibration()
+                        get_runtime_state().reset_fp8_comms_calibration(self.transformer_2)
                     current_model = self.transformer_2
                     current_guidance_scale = guidance_scale_2
 
@@ -218,7 +218,7 @@ class xFuserWanImageToVideoPipeline(WanImageToVideoPipeline):
                     )[0]
 
                 # sync fp8_comms running max after first denoising step (pure Python, outside compiled region)
-                get_runtime_state().sync_fp8_comms()
+                get_runtime_state().sync_fp8_comms(current_model)
 
                 if self.do_classifier_free_guidance:
                     if do_cfg_parallel:

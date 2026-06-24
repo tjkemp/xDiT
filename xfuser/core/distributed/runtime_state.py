@@ -81,6 +81,7 @@ class Fp8CommsState:
         self.k_running_max = torch.zeros(1, dtype=torch.float32)
         self.v_running_max = torch.zeros(1, dtype=torch.float32)
         self.synced = fixed_scale is not None  # fixed scale needs no sync; dynamic starts unsynced
+        self.calibrated_model_ids: set = set()  # models already calibrated; skip reset for these
 
     def update_running_max(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         """Update running amaxes in-place. Safe inside compiled region -- pure tensor ops."""
@@ -192,8 +193,9 @@ class RuntimeState(metaclass=ABCMeta):
             logger.warning("FP8 communication enabled with dynamic scaling (calibrated after step 1).")
         self.fp8_comms = Fp8CommsState(fixed_scale=scale)
 
-    def sync_fp8_comms(self):
-        """All-reduce running amaxes and update scales. Call from pipeline loop (outside compiled region)."""
+    def sync_fp8_comms(self, model=None):
+        """All-reduce running amaxes and update scales. Call from pipeline loop (outside compiled region).
+        Pass model to mark it as calibrated so subsequent generations skip recalibration."""
         fp8_comms = self.fp8_comms
         if fp8_comms is None or fp8_comms.fixed_scale is not None or fp8_comms.synced:
             return
@@ -210,14 +212,19 @@ class RuntimeState(metaclass=ABCMeta):
         fp8_comms.k_running_max.zero_()
         fp8_comms.v_running_max.zero_()
         fp8_comms.synced = True
+        if model is not None:
+            fp8_comms.calibrated_model_ids.add(id(model))
         if dist.get_rank() == 0:
             print(f"[fp8_comms] scales synced: q={fp8_comms.q_scale.item():.6f} k={fp8_comms.k_scale.item():.6f} v={fp8_comms.v_scale.item():.6f} (from amaxes q={maxes[0].item():.4f} k={maxes[1].item():.4f} v={maxes[2].item():.4f})")
 
-    def reset_fp8_comms_calibration(self):
-        """Reset scales to 1.0 for recalibration (e.g. on transformer switch). Call from pipeline loop."""
+    def reset_fp8_comms_calibration(self, model=None):
+        """Reset scales for recalibration when switching to a new model. No-op if already calibrated."""
         fp8_comms = self.fp8_comms
         if fp8_comms is None or fp8_comms.fixed_scale is not None:
             return
+        model_id = id(model)
+        if model_id in fp8_comms.calibrated_model_ids:
+            return  # already calibrated for this model, keep scales
         fp8_comms.q_scale.fill_(1.0)
         fp8_comms.k_scale.fill_(1.0)
         fp8_comms.v_scale.fill_(1.0)
