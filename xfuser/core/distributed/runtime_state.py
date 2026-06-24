@@ -206,6 +206,8 @@ class RuntimeState(metaclass=ABCMeta):
         fp8_comms.k_running_max.zero_()
         fp8_comms.v_running_max.zero_()
         fp8_comms.synced = True
+        if dist.get_rank() == 0:
+            print(f"[fp8_comms] scales synced: q={fp8_comms.q_scale.item():.6f} k={fp8_comms.k_scale.item():.6f} v={fp8_comms.v_scale.item():.6f} (from amaxes q={maxes[0].item():.4f} k={maxes[1].item():.4f} v={maxes[2].item():.4f})")
 
     def reset_fp8_comms_calibration(self):
         """Reset scales to 1.0 for recalibration (e.g. on transformer switch). Call from pipeline loop."""
