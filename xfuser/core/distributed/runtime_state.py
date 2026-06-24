@@ -72,14 +72,15 @@ class Fp8CommsState:
     """
     def __init__(self, fixed_scale: Optional[float] = None):
         self.fixed_scale = fixed_scale
-        s = float(fixed_scale) if fixed_scale is not None else 1.0
-        self.q_scale = torch.tensor([s], dtype=torch.float32)
-        self.k_scale = torch.tensor([s], dtype=torch.float32)
-        self.v_scale = torch.tensor([s], dtype=torch.float32)
+        # fixed scale: initialize to that value; dynamic: initialize to 1.0 (safe, no clipping)
+        init = float(fixed_scale) if fixed_scale is not None else 1.0
+        self.q_scale = torch.tensor([init], dtype=torch.float32)
+        self.k_scale = torch.tensor([init], dtype=torch.float32)
+        self.v_scale = torch.tensor([init], dtype=torch.float32)
         self.q_running_max = torch.zeros(1, dtype=torch.float32)
         self.k_running_max = torch.zeros(1, dtype=torch.float32)
         self.v_running_max = torch.zeros(1, dtype=torch.float32)
-        self.synced = fixed_scale is not None  # fixed scale needs no sync
+        self.synced = fixed_scale is not None  # fixed scale needs no sync; dynamic starts unsynced
 
     def update_running_max(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         """Update running amaxes in-place. Safe inside compiled region -- pure tensor ops."""
@@ -185,7 +186,10 @@ class RuntimeState(metaclass=ABCMeta):
             self.fp8_comms = None
             return
         scale = config.runtime_config.fp8_comms_scale
-        logger.warning(f"FP8 communication enabled with scale {scale}.")
+        if scale is not None:
+            logger.warning(f"FP8 communication enabled with fixed scale {scale}.")
+        else:
+            logger.warning("FP8 communication enabled with dynamic scaling (calibrated after step 1).")
         self.fp8_comms = Fp8CommsState(fixed_scale=scale)
 
     def sync_fp8_comms(self):
