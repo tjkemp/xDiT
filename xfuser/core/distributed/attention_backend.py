@@ -378,11 +378,13 @@ if env_info["has_aiter"]:
     try:
         from aiter.ops.mha import flash_attn_mxfp4_sparse_pertensor_func
         from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
+        from aiter.ops.triton.quant.sage_attention_quant_fp8_input_wrapper import sage_quant_mxfp4_fp8_input
     except ImportError:
         pass # Error is raised in runtime_state.py if AITER_SPARGE_ASM_V2 is not available.
     try:
         from aiter.ops.mha import flash_attn_mxfp4_pertensor_func
         from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
+        from aiter.ops.triton.quant.sage_attention_quant_fp8_input_wrapper import sage_quant_mxfp4_fp8_input
     except ImportError:
         pass # Error is raised in runtime_state.py if AITER_MXFP4 is not available.
     try:
@@ -484,6 +486,8 @@ class AttentionBackendType(Enum):
 SUPPORTS_PRE_QUANTIZATION_BACKENDS = {
     AttentionBackendType.AITER_FP8,
     AttentionBackendType.AITER_SAGE_V2,
+    AttentionBackendType.AITER_MXFP4,
+    AttentionBackendType.AITER_SPARGE_ASM_V2,
 }
 
 def register_attention_function(backend_type):
@@ -783,16 +787,35 @@ def _aiter_mxfp4_attn_call(query, key, value, dropout_p, is_causal, attention_kw
     v_bshd = torch.permute(value, [0, 2, 1, 3]).contiguous()
 
     fp8_type = aiter.dtypes.fp8
-    qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(
-        q_bshd, k_bshd, v_bshd,
-        fp8_type, torch.finfo(fp8_type).max,
-        BLKQ=_AITER_SPARGE_ASM_BLOCK_M,
-        BLKK=64,
-        layout="bshd",
-        R=HADAMARD_MATRIX[q_bshd.device],
-        BLOCK_R=AITER_SAGE_V2_BLOCK_R,
-        q_smoothing=False,
-    )
+    if q_bshd.dtype in _FP8_DTYPES:
+        # Q/K already fp8 (e.g. from --use-fp8-comms A2A); skip redundant bf16->fp8 cast.
+        v_scale = None
+        if v_bshd.dtype in _FP8_DTYPES:
+            # fp8_comms uses a global per-tensor scale (shape [1]); expand to [B, H, D]
+            # so sage_quant_mxfp4_fp8_input sees the uniform scale it expects.
+            b, s, h, d = v_bshd.shape  # bshd layout
+            v_scale = get_runtime_state().fp8_comms.v_scale.expand(b, h, d).contiguous()
+        qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4_fp8_input(
+            q_bshd, k_bshd, v_bshd,
+            fp8_type, torch.finfo(fp8_type).max,
+            BLKQ=_AITER_SPARGE_ASM_BLOCK_M,
+            BLKK=64,
+            layout="bshd",
+            R=HADAMARD_MATRIX[q_bshd.device],
+            BLOCK_R=AITER_SAGE_V2_BLOCK_R,
+            v_scale=v_scale,
+        )
+    else:
+        qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(
+            q_bshd, k_bshd, v_bshd,
+            fp8_type, torch.finfo(fp8_type).max,
+            BLKQ=_AITER_SPARGE_ASM_BLOCK_M,
+            BLKK=64,
+            layout="bshd",
+            R=HADAMARD_MATRIX[q_bshd.device],
+            BLOCK_R=AITER_SAGE_V2_BLOCK_R,
+            q_smoothing=False,
+        )
 
     # qq.shape[-1] = hd/2 because of fp4 packing.
     softmax_scale = (qq.shape[-1] * 2) ** -0.5
@@ -1276,16 +1299,35 @@ def _aiter_sparge_asm_v2_attn_call(query, key, value, dropout_p, is_causal, atte
     v_bshd = v.permute(0, 2, 1, 3).contiguous()
 
     fp8_type = aiter.dtypes.fp8
-    qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(
-        q_bshd, k_bshd, v_bshd,
-        fp8_type, torch.finfo(fp8_type).max,
-        BLKQ=_AITER_SPARGE_ASM_BLOCK_M,
-        BLKK=64,
-        layout="bshd",
-        R=HADAMARD_MATRIX[q_bshd.device],
-        BLOCK_R=AITER_SAGE_V2_BLOCK_R,
-        q_smoothing=False,
-    )
+    if q_bshd.dtype in _FP8_DTYPES:
+        # Q/K already fp8 (e.g. from --use-fp8-comms A2A); skip redundant bf16->fp8 cast.
+        v_scale = None
+        if v_bshd.dtype in _FP8_DTYPES:
+            # fp8_comms uses a global per-tensor scale (shape [1]); expand to [B, H, D]
+            # so sage_quant_mxfp4_fp8_input sees the uniform scale it expects.
+            b, s, h, d = v_bshd.shape  # bshd layout
+            v_scale = get_runtime_state().fp8_comms.v_scale.expand(b, h, d).contiguous()
+        qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4_fp8_input(
+            q_bshd, k_bshd, v_bshd,
+            fp8_type, torch.finfo(fp8_type).max,
+            BLKQ=_AITER_SPARGE_ASM_BLOCK_M,
+            BLKK=64,
+            layout="bshd",
+            R=HADAMARD_MATRIX[q_bshd.device],
+            BLOCK_R=AITER_SAGE_V2_BLOCK_R,
+            v_scale=v_scale,
+        )
+    else:
+        qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(
+            q_bshd, k_bshd, v_bshd,
+            fp8_type, torch.finfo(fp8_type).max,
+            BLKQ=_AITER_SPARGE_ASM_BLOCK_M,
+            BLKK=64,
+            layout="bshd",
+            R=HADAMARD_MATRIX[q_bshd.device],
+            BLOCK_R=AITER_SAGE_V2_BLOCK_R,
+            q_smoothing=False,
+        )
 
     kv_block_indices, lut_start, lut_count = block_attn_mask_to_ragged_lut(
         block_mask,
