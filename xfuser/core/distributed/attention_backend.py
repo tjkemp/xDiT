@@ -805,6 +805,7 @@ def _aiter_mxfp4_attn_call(query, key, value, dropout_p, is_causal, attention_kw
         # Q/K already fp8; skip redundant bf16->fp8 cast.
         v_scale = None
         if v_bshd.dtype in _FP8_DTYPES:
+            from xfuser.core.distributed.runtime_state import get_runtime_state
             b, s, h, d = v_bshd.shape
             v_scale = get_runtime_state().fp8_comms.v_scale.expand(b, h, d).contiguous()
         qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4_fp8_input(
@@ -1320,6 +1321,7 @@ def _aiter_sparge_asm_v2_attn_call(query, key, value, dropout_p, is_causal, atte
         # Q/K already fp8; skip redundant bf16->fp8 cast.
         v_scale = None
         if v_bshd.dtype in _FP8_DTYPES:
+            from xfuser.core.distributed.runtime_state import get_runtime_state
             b, s, h, d = v_bshd.shape
             v_scale = get_runtime_state().fp8_comms.v_scale.expand(b, h, d).contiguous()
         qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4_fp8_input(
