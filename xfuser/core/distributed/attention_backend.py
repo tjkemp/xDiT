@@ -802,12 +802,10 @@ def _aiter_mxfp4_attn_call(query, key, value, dropout_p, is_causal, attention_kw
 
     fp8_type = aiter.dtypes.fp8
     if q_bshd.dtype in _FP8_DTYPES:
-        # Q/K already fp8 (e.g. from --use-fp8-comms A2A); skip redundant bf16->fp8 cast.
+        # Q/K already fp8; skip redundant bf16->fp8 cast.
         v_scale = None
         if v_bshd.dtype in _FP8_DTYPES:
-            # fp8_comms uses a global per-tensor scale (shape [1]); expand to [B, H, D]
-            # so sage_quant_mxfp4_fp8_input sees the uniform scale it expects.
-            b, s, h, d = v_bshd.shape  # bshd layout
+            b, s, h, d = v_bshd.shape
             v_scale = get_runtime_state().fp8_comms.v_scale.expand(b, h, d).contiguous()
         qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4_fp8_input(
             q_bshd, k_bshd, v_bshd,
@@ -1319,12 +1317,10 @@ def _aiter_sparge_asm_v2_attn_call(query, key, value, dropout_p, is_causal, atte
 
     fp8_type = aiter.dtypes.fp8
     if q_bshd.dtype in _FP8_DTYPES:
-        # Q/K already fp8 (e.g. from --use-fp8-comms A2A); skip redundant bf16->fp8 cast.
+        # Q/K already fp8; skip redundant bf16->fp8 cast.
         v_scale = None
         if v_bshd.dtype in _FP8_DTYPES:
-            # fp8_comms uses a global per-tensor scale (shape [1]); expand to [B, H, D]
-            # so sage_quant_mxfp4_fp8_input sees the uniform scale it expects.
-            b, s, h, d = v_bshd.shape  # bshd layout
+            b, s, h, d = v_bshd.shape
             v_scale = get_runtime_state().fp8_comms.v_scale.expand(b, h, d).contiguous()
         qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4_fp8_input(
             q_bshd, k_bshd, v_bshd,

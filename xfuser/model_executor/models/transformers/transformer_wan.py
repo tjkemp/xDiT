@@ -127,6 +127,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             and runtime_state.fp8_comms is not None
             and runtime_state.attention_backend in SUPPORTS_PRE_QUANTIZATION_BACKENDS
         )
+        query_dtype = query.dtype
 
         # update running max for dynamic scale calibration -- pure in-place tensor ops, no graph break
         if not self.is_cross_attention and runtime_state.fp8_comms is not None:
@@ -148,7 +149,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                                                         attention_kwargs=self.attention_kwargs,
                                                         use_fp8_comms=use_fp8_comms).transpose(1, 2)
             hidden_states_img = hidden_states_img.flatten(2, 3)
-            hidden_states_img = hidden_states_img.type_as(query)
+            hidden_states_img = hidden_states_img.to(query_dtype)
 
         hidden_states = self.attention_function(
             query.transpose(1, 2),
@@ -161,7 +162,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         ).transpose(1, 2)
 
         hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.type_as(query)
+        hidden_states = hidden_states.to(query_dtype)
 
         if hidden_states_img is not None:
             hidden_states = hidden_states + hidden_states_img
