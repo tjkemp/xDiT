@@ -296,6 +296,11 @@ class xFuserModel(abc.ABC):
             effective_backends.add(_parse_attention_backend(config.attention_backend, "attention backend"))
         if config.use_hybrid_attn_schedule and config.hybrid_attn_low_precision_backend:
             effective_backends.add(_parse_attention_backend(config.hybrid_attn_low_precision_backend, "hybrid low-precision attention backend"))
+        if config.use_hybrid_attn_schedule and config.hybrid_attn_schedule:
+            for name in config.hybrid_attn_schedule.split(","):
+                name = name.strip()
+                if name:
+                    effective_backends.add(_parse_attention_backend(name, "hybrid_attn_schedule"))
         if not effective_backends & SUPPORTS_PRE_QUANTIZATION_BACKENDS:
             raise ValueError(
                 f"--use_fp8_comms requires an attention backend that supports pre-quantization "
