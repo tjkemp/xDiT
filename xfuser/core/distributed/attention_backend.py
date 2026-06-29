@@ -788,6 +788,18 @@ def _aiter_mxfp4_attn_call(query, key, value, dropout_p, is_causal, attention_kw
     k_bshd = torch.permute(key,   [0, 2, 1, 3]).contiguous()
     v_bshd = torch.permute(value, [0, 2, 1, 3]).contiguous()
 
+    # WORKAROUND: partial last tile (seqlen % 128 != 0) hits a buggy masked-tail
+    # path in the .co kernel and returns garbage. Pad to next multiple of 128.
+    _MXFP4_TILE = 128
+    sq = q_bshd.shape[1]
+    q_pad = (-sq) % _MXFP4_TILE
+    k_pad = (-k_bshd.shape[1]) % _MXFP4_TILE
+    if q_pad:
+        q_bshd = F.pad(q_bshd, (0, 0, 0, 0, 0, q_pad))
+    if k_pad:
+        k_bshd = F.pad(k_bshd, (0, 0, 0, 0, 0, k_pad))
+        v_bshd = F.pad(v_bshd, (0, 0, 0, 0, 0, k_pad))
+
     fp8_type = aiter.dtypes.fp8
     if q_bshd.dtype in _FP8_DTYPES:
         # Q/K already fp8 (e.g. from --use-fp8-comms A2A); skip redundant bf16->fp8 cast.
@@ -826,6 +838,11 @@ def _aiter_mxfp4_attn_call(query, key, value, dropout_p, is_causal, attention_kw
         qd.contiguous(), kd.contiguous(), vd.to(torch.float32).contiguous(),
         softmax_scale=float(softmax_scale),
     )
+    # WORKAROUND: kernel has a systematic 2x softmax-denominator bug -> output is
+    # exactly 0.5x correct magnitude. Rescale and strip padding rows.
+    out_bshd = out_bshd * 2.0
+    if q_pad:
+        out_bshd = out_bshd[:, :sq]
     return torch.permute(out_bshd, [0, 2, 1, 3]), None
 
 
