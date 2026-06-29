@@ -29,6 +29,8 @@ if env_info.get("has_aiter"):
 else:
     AITER_FP8_DTYPE = torch.float8_e4m3fn  # fallback only; fp8_comms requires aiter so this path is unreachable in practice
 
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
+
 def _setup_aiter_environment_variables():
     AITER_FP8_STATIC_SCALE_WITH_DESCALE = environment_variables["AITER_FP8_STATIC_SCALE_WITH_DESCALE"]()
     try:
