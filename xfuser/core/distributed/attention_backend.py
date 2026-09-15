@@ -1171,24 +1171,49 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
 
     if pre_quantized:
-        # Q/K/V arrive already FP8 from fp8 comms (quantized before the Ulysses
-        # all-to-all).
-        if (attention_kwargs or {}).get("indices_k") is not None:
-            raise NotImplementedError(
-                "fp8 comms pre-quantized attention does not support varlen packing; "
-                "the indices_k mask would be silently dropped and dense attention would "
-                "run over padded keys."
+        # Q/K/V arrive already rotated + FP8-quantized from fp8 comms (before the
+        # Ulysses all-to-all), so skip rotation and internal quantization and feed the
+        # descales straight to the kernel. Packed varlen (MiniMax-H3) and dense (Wan)
+        # both supported; only K/V are packed, Q is reshaped (see _varlen_pack_keys).
+        packed = _varlen_pack_keys(query, key, value, attention_kwargs)
+        if packed is not None:
+            (
+                query,
+                key,
+                value,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_k,
+                batch_size,
+                sequence_length,
+                num_heads,
+                head_dim,
+            ) = packed
+            output = aiter.flash_attn_varlen_fp8_pertensor_func(
+                query,
+                key,
+                value,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=sequence_length,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=head_dim ** -0.5,
+                causal=is_causal,
+                q_descale=attention_kwargs["q_descale"],
+                k_descale=attention_kwargs["k_descale"],
+                v_descale=attention_kwargs["v_descale"],
+            ).reshape(batch_size, sequence_length, num_heads, head_dim)
+        else:
+            output = aiter.flash_attn_fp8_pertensor_func(
+                query,
+                key,
+                value,
+                causal=is_causal,
+                softmax_scale=query.shape[-1] ** -0.5,
+                q_descale=attention_kwargs["q_descale"],
+                k_descale=attention_kwargs["k_descale"],
+                v_descale=attention_kwargs["v_descale"],
             )
-        output = aiter.flash_attn_fp8_pertensor_func(
-            query,
-            key,
-            value,
-            causal=is_causal,
-            softmax_scale=query.shape[-1] ** -0.5,
-            q_descale=attention_kwargs["q_descale"],
-            k_descale=attention_kwargs["k_descale"],
-            v_descale=attention_kwargs["v_descale"],
-        )
         output = torch.permute(output, [0, 2, 1, 3])
         return output, None
 

@@ -294,8 +294,9 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         comms is enabled, before compile). No buffers are added when fp8 comms is off."""
         if fp8_comms is None:
             return
-        install_fp8_comms_layer_state(self)
-        fp8_comms.register_model(self, len(self.blocks))
+        attn_modules = [block.attn1 for block in self.blocks]
+        install_fp8_comms_layer_state(self, attn_modules)
+        fp8_comms.register_model(self, attn_modules)
 
 
     def _chunk_and_pad_sequence(self, x: torch.Tensor, sp_world_rank: int, sp_world_size: int, pad_amount: int, dim: int) -> torch.Tensor:

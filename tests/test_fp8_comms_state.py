@@ -33,7 +33,7 @@ class _FakeTransformer(nn.Module):
 def test_per_layer_running_max_and_scatter():
     fp8 = Fp8CommsState()
     model = _FakeTransformer(num_layers=2)
-    fp8.register_model(model, num_layers=2)
+    fp8.register_model(model, [b.attn1 for b in model.blocks])
 
     layer_idx = torch.tensor([0], dtype=torch.long)
     q = torch.tensor([[[[2.0, -1.0]]]])
@@ -65,7 +65,7 @@ def test_per_layer_running_max_and_scatter():
 def test_fixed_scale_broadcast():
     fp8 = Fp8CommsState(fixed_scale=0.5)
     model = _FakeTransformer(num_layers=2)
-    fp8.register_model(model, num_layers=2)
+    fp8.register_model(model, [b.attn1 for b in model.blocks])
 
     assert fp8.get_model_state(model).synced is True
     assert model.blocks[0].attn1.fp8_q_scale.item() == 0.5
@@ -76,11 +76,40 @@ def test_fixed_scale_broadcast():
 def test_unexercised_model_has_zero_running_max():
     fp8 = Fp8CommsState()
     model = _FakeTransformer(num_layers=1)
-    fp8.register_model(model, num_layers=1)
+    fp8.register_model(model, [b.attn1 for b in model.blocks])
 
     model_state = fp8.get_model_state(model)
     assert model_state.synced is False
     assert model_state.q_running_max.max() == 0
+
+
+def test_register_model_keys_off_the_attn_module_list_not_the_tree():
+    # MiniMax-H3 shape: transformer_blocks + attn (not blocks/attn1). The state keys
+    # off the passed attn-module list, so any container/name works with no per-model
+    # coupling in fp8_comms.
+    class _Attn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            for name in ("fp8_q_scale", "fp8_k_scale", "fp8_v_scale", "fp8_o_scale"):
+                self.register_buffer(name, torch.ones(1, dtype=torch.float32))
+
+    class _Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = _Attn()
+
+    class _MiniMaxLike(nn.Module):
+        def __init__(self, n):
+            super().__init__()
+            self.transformer_blocks = nn.ModuleList([_Block() for _ in range(n)])
+
+    fp8 = Fp8CommsState(fixed_scale=0.5)
+    model = _MiniMaxLike(3)
+    fp8.register_model(model, [b.attn for b in model.transformer_blocks])
+
+    assert fp8.get_model_state(model).synced is True
+    assert model.transformer_blocks[0].attn.fp8_q_scale.item() == 0.5
+    assert model.transformer_blocks[2].attn.fp8_o_scale.item() == 0.5
 
 
 def _outlier_qk(head_dim: int = 128, seq: int = 64, dtype=torch.bfloat16, device=_HB_DEVICE):
@@ -143,7 +172,7 @@ def test_calibrated_scale_matches_the_rotated_tensor():
     safety_factor = 0.85
     fp8 = Fp8CommsState(safety_factor=safety_factor)
     model = _FakeTransformer(num_layers=1)
-    fp8.register_model(model, num_layers=1)
+    fp8.register_model(model, [b.attn1 for b in model.blocks])
     # Running-max buffers default to CPU; move them to the rotation device so the
     # in-place maximum in update_running_max stays on one device.
     fp8.get_model_state(model).to_device_(_HB_DEVICE)

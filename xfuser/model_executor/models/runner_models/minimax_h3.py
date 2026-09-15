@@ -274,6 +274,7 @@ class xFuserMiniMaxH3Model(xFuserModel):
         fully_shard_degree=True,
         use_fp8_gemms=True,
         use_fp4_gemms=True,
+        use_fp8_comms=True,
         use_hybrid_attn_schedule=True,
         enable_slicing=False,
         enable_tiling=False,
@@ -334,11 +335,21 @@ class xFuserMiniMaxH3Model(xFuserModel):
                 )
             if backend == AttentionBackendType.AITER_FP8:
                 try:
-                    from aiter import flash_attn_varlen_fp8_pertensor_func  # noqa: F401
+                    from aiter import flash_attn_varlen_fp8_pertensor_func
                 except ImportError:
                     raise RuntimeError(
                         "MiniMax-H3 FP8 attention requires AITER varlen FP8 flash attention."
                     ) from None
+                if config.use_fp8_comms:
+                    import inspect
+
+                    if "q_descale" not in inspect.signature(
+                        flash_attn_varlen_fp8_pertensor_func
+                    ).parameters:
+                        raise RuntimeError(
+                            "MiniMax-H3 --use_fp8_comms needs an AITER build whose "
+                            "flash_attn_varlen_fp8_pertensor_func accepts q_descale."
+                        )
 
         ulysses_degree = config.ulysses_degree or 1
         if ulysses_degree not in _SUPPORTED_ULYSSES_DEGREES:

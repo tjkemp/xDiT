@@ -19,6 +19,11 @@ from xfuser.core.distributed import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from xfuser.core.distributed.fp8_comms import (
+    fp8_attention_kwargs,
+    fp8_observe_output,
+    install_fp8_comms_layer_state,
+)
 from xfuser.model_executor.layers.usp import USP, attention
 
 
@@ -73,6 +78,16 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
             and get_ulysses_parallel_world_size() > 1
         )
         attention_function = USP if use_ulysses else attention
+
+        runtime_state = get_runtime_state()
+        fp8_backend = self.backend if self.backend is not None else runtime_state.attention_backend
+        # No-op ({}) unless fp8 comms is on for this self-attn module (MiniMax has no
+        # cross-attention). Also accumulates calibration amaxes as a side effect.
+        fp8_kwargs = fp8_attention_kwargs(
+            runtime_state.fp8_comms, attn, query, key, value,
+            is_cross_attention=False, backend=fp8_backend,
+        )
+
         attention_args = {
             "dropout_p": 0.0,
             "is_causal": False,
@@ -87,7 +102,12 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
             key.transpose(1, 2),
             value.transpose(1, 2),
             **attention_args,
+            **fp8_kwargs,
         ).transpose(1, 2)
+
+        fp8_observe_output(
+            runtime_state.fp8_comms, attn, hidden_states, is_cross_attention=False
+        )
 
         hidden_states = hidden_states.flatten(2, 3).type_as(query)
         hidden_states = attn.to_out[0](hidden_states)
@@ -120,6 +140,16 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
         self.register_forward_pre_hook(
             lambda module, args: get_runtime_state().increment_step_counter()
         )
+
+    def register_fp8_comms_state(self, fp8_comms) -> None:
+        """Install per-layer fp8 buffers on the Ulysses self-attention modules and register
+        running-max state (called only when fp8 comms is enabled, before compile). The
+        token_refiner blocks are excluded because they do not use Ulysses."""
+        if fp8_comms is None:
+            return
+        attn_modules = [block.attn for block in self.transformer_blocks]
+        install_fp8_comms_layer_state(self, attn_modules)
+        fp8_comms.register_model(self, attn_modules)
 
     @staticmethod
     def _pad_rows(

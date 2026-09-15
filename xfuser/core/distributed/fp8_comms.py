@@ -45,9 +45,16 @@ class Fp8CommsCall(NamedTuple):
 
 
 class Fp8CommsModelState:
-    """Per-transformer FP8 comms calibration state (one entry per self-attn layer)."""
+    """Per-transformer FP8 comms calibration state (one entry per self-attn layer).
 
-    def __init__(self, num_layers: int):
+    ``attn_modules`` is the ordered list of self-attention modules the transformer wants
+    instrumented; the fp8 scale buffers live on those modules, so the model tree layout
+    (``blocks``/``attn1`` vs ``transformer_blocks``/``attn``) stays out of this class.
+    """
+
+    def __init__(self, attn_modules):
+        self.attn_modules = list(attn_modules)
+        num_layers = len(self.attn_modules)
         self.q_running_max = torch.zeros(num_layers, dtype=torch.float32)
         self.k_running_max = torch.zeros(num_layers, dtype=torch.float32)
         self.v_running_max = torch.zeros(num_layers, dtype=torch.float32)
@@ -108,12 +115,16 @@ class Fp8CommsState:
 
     # ---- per-model registration / state ------------------------------------
 
-    def register_model(self, model, num_layers: int) -> None:
-        """Register a transformer for per-layer FP8 comms calibration."""
+    def register_model(self, model, attn_modules) -> None:
+        """Register a transformer for per-layer FP8 comms calibration.
+
+        ``attn_modules`` is the ordered list of self-attention modules to instrument
+        (each already carries the fp8 scale buffers from install_fp8_comms_layer_state).
+        """
         model_id = id(model)
         if model_id in self._models:
             return
-        self._models[model_id] = Fp8CommsModelState(num_layers)
+        self._models[model_id] = Fp8CommsModelState(attn_modules)
         if self.fixed_scale is not None:
             self.apply_fixed_scales_to_model(model)
             self._models[model_id].synced = True
@@ -124,11 +135,11 @@ class Fp8CommsState:
     def apply_fixed_scales_to_model(self, model) -> None:
         """Broadcast a fixed scale to all self-attention layer buffers."""
         scale = float(self.fixed_scale)
-        for block in model.blocks:
-            block.attn1.fp8_q_scale.fill_(scale)
-            block.attn1.fp8_k_scale.fill_(scale)
-            block.attn1.fp8_v_scale.fill_(scale)
-            block.attn1.fp8_o_scale.fill_(scale)
+        for attn in self.get_model_state(model).attn_modules:
+            attn.fp8_q_scale.fill_(scale)
+            attn.fp8_k_scale.fill_(scale)
+            attn.fp8_v_scale.fill_(scale)
+            attn.fp8_o_scale.fill_(scale)
 
     def to_device_(self, device: torch.device):
         for model_state in self._models.values():
@@ -186,11 +197,11 @@ class Fp8CommsState:
         v_scales: torch.Tensor,
         o_scales: torch.Tensor,
     ):
-        for i, block in enumerate(model.blocks):
-            block.attn1.fp8_q_scale.copy_(q_scales[i : i + 1])
-            block.attn1.fp8_k_scale.copy_(k_scales[i : i + 1])
-            block.attn1.fp8_v_scale.copy_(v_scales[i : i + 1])
-            block.attn1.fp8_o_scale.copy_(o_scales[i : i + 1])
+        for i, attn in enumerate(self.get_model_state(model).attn_modules):
+            attn.fp8_q_scale.copy_(q_scales[i : i + 1])
+            attn.fp8_k_scale.copy_(k_scales[i : i + 1])
+            attn.fp8_v_scale.copy_(v_scales[i : i + 1])
+            attn.fp8_o_scale.copy_(o_scales[i : i + 1])
 
     def sync(self, model) -> None:
         """All-reduce per-layer running amaxes and scatter scales into attn1 buffers.
@@ -252,7 +263,7 @@ class Fp8CommsState:
 
     def register_models(self, pipe) -> None:
         """Register the pipe's transformer(s) and move running-max buffers to GPU."""
-        for name in ("transformer", "transformer_2"):
+        for name in ("transformer", "transformer_2", "transformer_ref"):
             transformer = getattr(pipe, name, None)
             if transformer is not None and hasattr(transformer, "register_fp8_comms_state"):
                 transformer.register_fp8_comms_state(self)
@@ -285,7 +296,7 @@ class Fp8CommsState:
         if batch_size and isinstance(calib_args.get("prompt"), list):
             calib_args["prompt"] = calib_args["prompt"][:batch_size]
         run_pipe_fn(calib_args)
-        for name in ("transformer", "transformer_2"):
+        for name in ("transformer", "transformer_2", "transformer_ref"):
             transformer = getattr(pipe, name, None)
             if transformer is not None:
                 self.sync(transformer)
@@ -329,17 +340,18 @@ class Fp8CommsState:
 # and so the transformer never touches fp8 buffer names or the backend gate.
 
 
-def install_fp8_comms_layer_state(transformer) -> None:
-    """Register the per-layer fp8-comms buffers on each self-attention module.
+def install_fp8_comms_layer_state(transformer, attn_modules) -> None:
+    """Register the per-layer fp8-comms buffers on each given self-attention module.
 
-    Owns the buffer contract (names/shapes + owner link). Buffers are non-persistent
-    (kept out of the state_dict) and registered pre-compile so torch.compile captures
-    them as graph inputs. Called after the model is loaded/moved to its device (via
-    register_fp8_comms_state), so each buffer is placed on its module's device rather
-    than defaulting to CPU.
+    ``attn_modules`` is the ordered list of self-attention modules to instrument, so the
+    transformer's tree layout (blocks/attn1 vs transformer_blocks/attn) stays with the
+    transformer. Owns the buffer contract (names/shapes + owner link). Buffers are
+    non-persistent (kept out of the state_dict) and registered pre-compile so torch.compile
+    captures them as graph inputs. Called after the model is loaded/moved to its device (via
+    register_fp8_comms_state), so each buffer is placed on its module's device rather than
+    defaulting to CPU.
     """
-    for layer_idx, block in enumerate(transformer.blocks):
-        attn = block.attn1
+    for layer_idx, attn in enumerate(attn_modules):
         device = next(attn.parameters()).device
         for name in ("fp8_q_scale", "fp8_k_scale", "fp8_v_scale", "fp8_o_scale"):
             attn.register_buffer(
