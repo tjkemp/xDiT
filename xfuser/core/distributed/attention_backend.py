@@ -1175,6 +1175,13 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
         # Ulysses all-to-all), so skip rotation and internal quantization and feed the
         # descales straight to the kernel. Packed varlen (MiniMax-H3) and dense (Wan)
         # both supported; only K/V are packed, Q is reshaped (see _varlen_pack_keys).
+        # Ensure all three tensors are native contiguous allocations with the same
+        # FP8 dtype -- the uint8 view the a2a uses for older NCCL can otherwise
+        # survive as a reinterpret_tensor that the kernel rejects.
+        fp8_dtype = query.dtype
+        query = query.contiguous()
+        key = key.to(fp8_dtype).contiguous()
+        value = value.to(fp8_dtype).contiguous()
         packed = _varlen_pack_keys(query, key, value, attention_kwargs)
         if packed is not None:
             (
