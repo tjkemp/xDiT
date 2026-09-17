@@ -1313,7 +1313,38 @@ def _aiter_mixed_attn_call(
 
 @register_attention_function(AttentionBackendType.AITER_BF16)
 def _aiter_bf16_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
-    """Run the AITER MHA v4 BF16 Q/K/V recipe."""
+    """Run the AITER MHA v4 BF16 Q/K/V recipe.
+
+    MHA v4 has no key-padding mask, so it cannot handle varlen-packed keys in
+    general. For single-segment packed sequences (e.g. MiniMax-H3 padded to a
+    64-token alignment boundary) we trim Q/K/V to the real token count and pad
+    the output back.
+    """
+    kwargs = attention_kwargs or {}
+    if kwargs.get("indices_k") is not None:
+        cu_seqlens_k = kwargs.get("cu_seqlens_k")
+        if cu_seqlens_k is None or cu_seqlens_k.numel() != 2:
+            raise NotImplementedError(
+                "MHA v4 BF16 does not support varlen packed keys with multiple segments"
+            )
+        max_seqlen_k = int(kwargs["max_seqlen_k"])
+        gathered_S = query.shape[2]
+        query = query[:, :, :max_seqlen_k].contiguous()
+        key   = key  [:, :, :max_seqlen_k].contiguous()
+        value = value[:, :, :max_seqlen_k].contiguous()
+        output, lse = _aiter_mixed_attn_call(
+            query, key, value,
+            _AiterAttentionFormat.BF16,
+            _AiterAttentionFormat.BF16,
+            dropout_p, is_causal, None,
+        )
+        if gathered_S > max_seqlen_k:
+            padded = output.new_zeros(
+                output.shape[0], output.shape[1], gathered_S, output.shape[3]
+            )
+            padded[:, :, :max_seqlen_k] = output
+            output = padded
+        return output, lse
     return _aiter_mixed_attn_call(
         query,
         key,
