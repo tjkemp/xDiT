@@ -38,12 +38,19 @@ _SUPPORTED_ATTN_BACKENDS = frozenset({
     AttentionBackendType.SDPA,
     AttentionBackendType.NVTE_FP8,
 })
-_FASTH3_ATTN_BACKENDS = frozenset({AttentionBackendType.FLEX_VSA_H3})
+_FASTH3_ATTN_BACKENDS = frozenset({
+    AttentionBackendType.AITER,
+    AttentionBackendType.FLEX_VSA_H3,
+    AttentionBackendType.AITER_BF16,
+    AttentionBackendType.AITER_FP8,
+})
 _SUPPORTED_ULYSSES_DEGREES = frozenset({1, 2, 4, 8})
 _SUPPORTED_TASKS = frozenset({"t2va", "i2va", "l2va", "fl2va", "ref2va"})
-FASTH3_MODEL_ID = (
-    "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree"
+FASTH3_MODEL_IDS = (
+    "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+    "FastVideo/FastVideo-FastH3-8-Step-V2",
 )
+FASTH3_MODEL_ID = FASTH3_MODEL_IDS[0]
 
 
 def _minimax_h3_parallel_decode_clip(self, z: torch.Tensor) -> torch.Tensor:
@@ -645,10 +652,10 @@ class xFuserMiniMaxH3Model(xFuserModel):
             log(f"Output video with audio saved to {output_path}")
 
 
-@register_model(FASTH3_MODEL_ID)
+@register_model(FASTH3_MODEL_IDS[0])
 @register_model("FastH3")
 class xFuserFastH3Model(xFuserMiniMaxH3Model):
-    """FastH3 Preview v1 runner.
+    """FastH3 V1 runner.
 
     Transformer attention goes through USP's backend selector. ``FLEX_VSA_H3``
     is the default and runs the sparse-distilled VSA-H3 kernel; other
@@ -696,8 +703,38 @@ class xFuserFastH3Model(xFuserMiniMaxH3Model):
         super()._validate_args(input_args)
         if input_args["num_inference_steps"] != 5:
             raise ValueError(
-                "FastH3 Preview v1 requires 5 scheduler points, which produce "
+                "FastH3 V1 requires 5 scheduler points, which produce "
                 "the checkpoint's trained 4 transformer forwards."
+            )
+
+
+@register_model(FASTH3_MODEL_IDS[1])
+class xFuserFastH3V2Model(xFuserFastH3Model):
+    """FastH3 V2 runner. Same VSA-H3 attention backend as V1 but trained for 9
+    scheduler points (8 transformer forwards)."""
+
+    default_input_values = DefaultInputValues(
+        height=768,
+        width=1344,
+        num_frames=124,
+        # MiniMaxH3Scheduler includes the terminal zero sigma, so nine points
+        # produce the eight transformer forwards used to train FastH3 V2.
+        num_inference_steps=9,
+    )
+
+    settings = copy.deepcopy(xFuserFastH3Model.settings)
+    settings.model_name = FASTH3_MODEL_IDS[1]
+    settings.output_name = "fasth3_v2"
+
+    _warmup_num_inference_steps = 9
+
+    def _validate_args(self, input_args: dict) -> None:
+        # Skip the V1 step-count check; delegate to xFuserMiniMaxH3Model.
+        xFuserMiniMaxH3Model._validate_args(self, input_args)
+        if input_args["num_inference_steps"] != 9:
+            raise ValueError(
+                "FastH3 V2 requires 9 scheduler points, which produce "
+                "the checkpoint's trained 8 transformer forwards."
             )
 
 
