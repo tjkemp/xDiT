@@ -634,6 +634,18 @@ class xFuserModel(abc.ABC):
     def _get_compile_dynamic(self) -> Optional[bool]:
         return None  # torch default (auto)
 
+    def _prefer_blockwise_compile(self) -> bool:
+        """Whether to compile each transformer block separately, even without FSDP or caching.
+
+        Whole-model compile traces the transformer's top-level forward. A model whose forward
+        runs host-side scalar or index work outside the block loop -- data-dependent shapes,
+        .item()/.tolist() syncs, Python-side metadata construction -- breaks that single graph
+        at every sync. Compiling per block keeps the setup eager and traces only the repeated
+        blocks, where the heavy compute lives and no host syncs occur. Default False; a model
+        whose forward needs it overrides to True.
+        """
+        return False
+
     def _mark_cudagraph_steps(self, component: torch.nn.Module) -> None:
         """Tell CUDA Graphs where one inference step ends, so the next may reuse its buffers.
 
@@ -701,7 +713,11 @@ class xFuserModel(abc.ABC):
             component = getattr(self.pipe, component_name, None)
             if component is None:
                 continue
-            if self.config.fully_shard_degree > 1 or self.config.cache_method:
+            if (
+                self.config.fully_shard_degree > 1
+                or self.config.cache_method
+                or self._prefer_blockwise_compile()
+            ):
                 # Per-block compile: leaves transformer as original object so cache-dit's
                 # transformer.forward patch remains visible during compiled execution.
                 wrap_attrs = self.settings.fsdp_strategy.get(component_name, {}).get("wrap_attrs", [])
