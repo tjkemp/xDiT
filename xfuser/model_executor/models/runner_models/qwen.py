@@ -231,10 +231,30 @@ class xFuserQwenImageModel(xFuserModel):
         return DiffusionOutput(images=output.images, pipe_args=input_args)
 
 
+def _qwen_image21_output_size(images, height, width, resolution=1024):
+    """Output (height, width): explicit when given, else the last condition image's aspect
+    ratio at ``resolution**2`` area -- what QwenImage21Pipeline picks itself -- else square."""
+    if height is not None and width is not None:
+        return height, width
+    if height is not None or width is not None:
+        raise ValueError("Qwen-Image-2.1 needs both --height and --width, or neither.")
+    if images:
+        from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import calculate_dimensions
+
+        image_width, image_height = images[-1].size
+        width, height, _ = calculate_dimensions(resolution * resolution, image_width / image_height)
+        return height, width
+    return resolution, resolution
+
+
 @register_model("Qwen/Qwen-Image-2.1")
 @register_model("Qwen-Image-2.1")
 class xFuserQwenImage21Model(xFuserModel):
-    """Qwen-Image 2.1 text-to-image.
+    """Qwen-Image 2.1 text-to-image and image-conditioned generation.
+
+    ``--input_images`` are passed to the pipeline as condition images: the ``Qwen3-VL``
+    encoder reads them as vision context and the VAE encodes them into prefix tokens.
+    Without ``--height``/``--width`` the output follows the last image's aspect ratio.
 
     2.1 is a distinct architecture from the 1.x Qwen-Image models: a single-stream,
     block-causal transformer (``QwenImage21Transformer2DModel``) with interleaved
@@ -266,9 +286,8 @@ class xFuserQwenImage21Model(xFuserModel):
         enable_tiling=True,
         enable_slicing=True,
     )
+    # No height/width: _preprocess_args_images resolves them, from the condition image when given.
     default_input_values = DefaultInputValues(
-        height=1024,
-        width=1024,
         num_inference_steps=40,
         # true_cfg_scale; 2.1 is meant to be sampled without guidance (cfg off at 1.0).
         # No default negative_prompt: with CFG off it would be ignored, and passing it
@@ -306,6 +325,18 @@ class xFuserQwenImage21Model(xFuserModel):
             **te_kwargs,
         )
         return pipe
+
+    def _preprocess_args_images(self, input_args: dict) -> dict:
+        input_args = super()._preprocess_args_images(input_args)
+        explicit = input_args.get("height") is not None and input_args.get("width") is not None
+        height, width = _qwen_image21_output_size(
+            input_args["input_images"], input_args.get("height"), input_args.get("width")
+        )
+        input_args["height"], input_args["width"] = height, width
+        if not explicit:
+            source = "last input image's aspect ratio" if input_args["input_images"] else "model default"
+            log(f"Qwen-Image-2.1: output size {width}x{height} (from {source}).")
+        return input_args
 
     def _post_load_and_state_initialization(self, input_args: dict) -> None:
         super()._post_load_and_state_initialization(input_args)
@@ -365,6 +396,7 @@ class xFuserQwenImage21Model(xFuserModel):
         true_cfg_scale = input_args["guidance_scale"]
         kwargs = {
             "prompt": input_args["prompt"],
+            "image": input_args["input_images"] or None,
             "height": input_args["height"],
             "width": input_args["width"],
             "num_inference_steps": input_args["num_inference_steps"],

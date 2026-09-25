@@ -424,6 +424,17 @@ xdit --model FLUX.1-dev \
     --num_inference_steps 50
 ```
 
+### Image-Conditioned Generation
+
+Qwen-Image-2.1 takes one or more condition images. Without `--height`/`--width`, the output follows the last image's aspect ratio at about 1024x1024.
+
+```bash
+xdit --model Qwen-Image-2.1 \
+    --prompt "Turn this into a watercolor painting" \
+    --input_images input.png \
+    --seed 42
+```
+
 ### Video Generation
 
 ```bash
