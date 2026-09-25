@@ -48,7 +48,7 @@ def test_supported_runner_families_declare_load_support():
             "xFuserWan22TI2VModel",
             "xFuserWan21VACEModel",
         },
-        "qwen.py": {"xFuserQwenImageEditModel", "xFuserQwenImageModel"},
+        "qwen.py": {"xFuserQwenImageEditModel", "xFuserQwenImageModel", "xFuserQwenImage21Model"},
         "hunyuan.py": {"xFuserHunyuanvideoModel"},
     }
 

@@ -13,13 +13,20 @@ from xfuser.model_executor.models.runner_models.base_model import (
     DiffusionOutput,
     ModelSettings,
     DIFFUSERS_FROM_SOURCE,
+    _parse_attention_backend,
 )
 from xfuser import xFuserArgs
+from xfuser.core.distributed import get_runtime_state
+from xfuser.core.distributed.attention_backend import AttentionBackendType
 from xfuser.core.utils.runner_utils import log
 from xfuser.model_executor.models.runner_models.loading.contracts import (
     LoadSupport,
     STANDARD_LOAD_ROUTES,
 )
+
+# Sparse and Sparge backends are already refused by the capability checks. FLEX_VSA_H3 is
+# neither, but needs per-head gate inputs that only the MiniMax-H3 processors supply.
+_QWEN_IMAGE_21_UNSUPPORTED_ATTENTION_BACKENDS = frozenset({AttentionBackendType.FLEX_VSA_H3})
 
 @register_model("Qwen/Qwen-Image-Edit-2511")
 @register_model("Qwen/Qwen-Image-Edit-2509")
@@ -300,6 +307,29 @@ class xFuserQwenImage21Model(xFuserModel):
         )
         return pipe
 
+    def _post_load_and_state_initialization(self, input_args: dict) -> None:
+        super()._post_load_and_state_initialization(input_args)
+        # After materialization: a processor set on the pre-materialized module is not the one that runs.
+        from xfuser.model_executor.models.transformers.transformer_qwenimage21 import (
+            xFuserQwenImage21AttnProcessor,
+        )
+
+        blocks = self.pipe.transformer.transformer_blocks
+        for block in blocks:
+            block.attn.set_processor(xFuserQwenImage21AttnProcessor())
+        log(f"Qwen-Image-2.1: decode attention uses {get_runtime_state().attention_backend.name}.")
+        if not self.config.use_torch_compile:
+            log("Qwen-Image-2.1: block-causal prefill uses per-segment SDPA.")
+
+    def _validate_config(self, config: xFuserArgs) -> None:
+        super()._validate_config(config)
+        backend = _parse_attention_backend(config.attention_backend, "attention backend")
+        if backend in _QWEN_IMAGE_21_UNSUPPORTED_ATTENTION_BACKENDS:
+            raise ValueError(
+                f"Model {self.settings.model_name} does not support attention backend {backend.name}: "
+                f"its decode attention is plain dense attention and cannot supply the backend's extra inputs."
+            )
+
     def _prefer_blockwise_compile(self) -> bool:
         # 2.1's forward does host-side scalar/index work outside the block loop --
         # prefix_len = int((~target_token_mask).sum()), build_token_metadata, and the
@@ -308,31 +338,26 @@ class xFuserQwenImage21Model(xFuserModel):
         return True
 
     def _compile_model(self, input_args: dict) -> None:
-        # Swap to the flex attention processor here, after loading and materialization and
-        # right before compile -- the latest safe point. Setting it in _load_model did not
-        # take effect at runtime, because the transformer is materialized afterwards and the
-        # processor on the pre-materialized module is not the one that ends up running.
-        #
         # Flex expresses 2.1's block-causal prefill as one flex_attention call, which the
         # per-block compile below then traces; it is efficient only once compiled, so this
         # only runs on the compile path (_compile_model is only called under torch.compile).
-        # Decode is unmasked full attention and stays on SDPA regardless.
-        from diffusers.models.transformers.transformer_qwenimage21 import (
-            QwenImage21FlexAttnProcessor,
+        # Decode stays on xDiT's attention backend either way.
+        from xfuser.model_executor.models.transformers.transformer_qwenimage21 import (
+            xFuserQwenImage21FlexAttnProcessor,
         )
         blocks = self.pipe.transformer.transformer_blocks
         try:
             for block in blocks:
-                block.attn.set_processor(QwenImage21FlexAttnProcessor())
+                block.attn.set_processor(xFuserQwenImage21FlexAttnProcessor())
             log(
-                f"Qwen-Image-2.1: enabled QwenImage21FlexAttnProcessor on {len(blocks)} "
-                f"blocks before compile."
+                f"Qwen-Image-2.1: block-causal prefill uses flex_attention on {len(blocks)} "
+                f"blocks."
             )
         except ImportError as exc:
             # flex_attention needs torch>=2.5 with torch.nn.attention.flex_attention.
             log(
-                f"Qwen-Image-2.1: flex_attention unavailable ({exc}); compiling with the "
-                f"default SDPA attention processor."
+                f"Qwen-Image-2.1: flex_attention unavailable ({exc}); block-causal prefill "
+                f"uses per-segment SDPA."
             )
         super()._compile_model(input_args)
 
