@@ -27,6 +27,8 @@ from xfuser.model_executor.models.runner_models.loading.contracts import (
 # Sparse and Sparge backends are already refused by the capability checks. FLEX_VSA_H3 is
 # neither, but needs per-head gate inputs that only the MiniMax-H3 processors supply.
 _QWEN_IMAGE_21_UNSUPPORTED_ATTENTION_BACKENDS = frozenset({AttentionBackendType.FLEX_VSA_H3})
+# num_attention_heads of the Qwen/Qwen-Image-2.1 transformer; Ulysses splits heads across ranks.
+_QWEN_IMAGE_21_NUM_HEADS = 32
 
 @register_model("Qwen/Qwen-Image-Edit-2511")
 @register_model("Qwen/Qwen-Image-Edit-2509")
@@ -262,11 +264,10 @@ class xFuserQwenImage21Model(xFuserModel):
     VAE. Those classes and the ``QwenImage21Pipeline`` ship only in a diffusers built
     from source, hence ``min_diffusers_version = DIFFUSERS_FROM_SOURCE``.
 
-    Sequence parallelism (Ulysses/Ring) is intentionally left off: 2.1's block-causal
-    attention with KV caching does not fit the sequence-chunk USP wrapper the 1.x
-    models use, and needs its own verified implementation. The supported scaling paths
-    for now are single-GPU acceleration (FP8 GEMMs, VAE tiling/slicing, CPU offload),
-    data parallelism and FSDP parameter sharding.
+    Ulysses sequence parallelism shards the transformer's block loop over the sequence and
+    gathers the whole sequence per head group for attention, so the block-causal prefill and
+    the prefix KV cache work unchanged (see ``xFuserQwenImage21TransformerWrapper``). Ring is
+    left off: it would split the block-causal mask across ranks.
     """
 
     min_diffusers_version = DIFFUSERS_FROM_SOURCE
@@ -278,11 +279,10 @@ class xFuserQwenImage21Model(xFuserModel):
         routes=STANDARD_LOAD_ROUTES,
     )
     capabilities = ModelCapabilities(
-        ulysses_degree=False,
+        ulysses_degree=True,
         ring_degree=False,
         fully_shard_degree=True,
         use_fp8_gemms=True,
-        use_parallel_vae=False,
         enable_tiling=True,
         enable_slicing=True,
     )
@@ -311,11 +311,11 @@ class xFuserQwenImage21Model(xFuserModel):
 
     def _load_model(self) -> DiffusionPipeline:
         from diffusers import QwenImage21Pipeline
-        from diffusers.models.transformers.transformer_qwenimage21 import (
-            QwenImage21Transformer2DModel,
+        from xfuser.model_executor.models.transformers.transformer_qwenimage21 import (
+            xFuserQwenImage21TransformerWrapper,
         )
 
-        transformer = self.loader.load_transformer(QwenImage21Transformer2DModel)
+        transformer = self.loader.load_transformer(xFuserQwenImage21TransformerWrapper)
         te_kwargs, te_quant = self.loader.plan_text_encoders()
         pipe = QwenImage21Pipeline.from_pretrained(
             pretrained_model_name_or_path=self.settings.model_name,
@@ -360,19 +360,19 @@ class xFuserQwenImage21Model(xFuserModel):
                 f"Model {self.settings.model_name} does not support attention backend {backend.name}: "
                 f"its decode attention is plain dense attention and cannot supply the backend's extra inputs."
             )
+        ulysses_degree = config.ulysses_degree or 1
+        if _QWEN_IMAGE_21_NUM_HEADS % ulysses_degree:
+            raise ValueError(
+                f"Model {self.settings.model_name} has {_QWEN_IMAGE_21_NUM_HEADS} attention heads; "
+                f"--ulysses_degree must divide it, got {ulysses_degree}."
+            )
 
     def _prefer_blockwise_compile(self) -> bool:
-        # 2.1's forward does host-side scalar/index work outside the block loop --
-        # prefix_len = int((~target_token_mask).sum()), build_token_metadata, and the
-        # prefix-segment .tolist() -- which breaks a whole-model graph at each sync.
-        # Compiling per block keeps that setup eager and traces only the blocks.
+        # 2.1's forward syncs to host outside the block loop (prefix_len, token metadata, segment .tolist()).
         return True
 
     def _compile_model(self, input_args: dict) -> None:
-        # Flex expresses 2.1's block-causal prefill as one flex_attention call, which the
-        # per-block compile below then traces; it is efficient only once compiled, so this
-        # only runs on the compile path (_compile_model is only called under torch.compile).
-        # Decode stays on xDiT's attention backend either way.
+        # flex_attention is only efficient compiled, so the one-call prefill is set up here, not at load.
         from xfuser.model_executor.models.transformers.transformer_qwenimage21 import (
             xFuserQwenImage21FlexAttnProcessor,
         )
@@ -403,9 +403,7 @@ class xFuserQwenImage21Model(xFuserModel):
             "true_cfg_scale": true_cfg_scale,
             "generator": self._make_generator(input_args["seed"]),
         }
-        # 2.1 samples without guidance by default (true_cfg_scale == 1.0). A negative
-        # prompt only takes effect when CFG is on; passing it otherwise is ignored and
-        # makes diffusers warn once per call. So only forward it when CFG is enabled.
+        # With CFG off diffusers ignores a negative prompt and warns on every call.
         negative_prompt = input_args.get("negative_prompt")
         if true_cfg_scale > 1 and negative_prompt:
             kwargs["negative_prompt"] = negative_prompt

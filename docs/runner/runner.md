@@ -428,6 +428,8 @@ xdit --model FLUX.1-dev \
 
 Qwen-Image-2.1 takes one or more condition images. Without `--height`/`--width`, the output follows the last image's aspect ratio at about 1024x1024.
 
+Its attention follows diffusers' design: the first step runs block-causal attention over the whole sequence and caches the prompt and condition-image K/V, and later steps recompute only the target image against that cache. `--attention_backend` applies to those cached decode steps; the one-time prefill uses per-segment SDPA, or flex_attention under `--use_torch_compile`.
+
 ```bash
 xdit --model Qwen-Image-2.1 \
     --prompt "Turn this into a watercolor painting" \

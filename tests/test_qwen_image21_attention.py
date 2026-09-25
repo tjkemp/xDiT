@@ -61,6 +61,9 @@ def xfuser_sdpa_calls(monkeypatch):
     monkeypatch.setattr(
         usp, "get_runtime_state", lambda: SimpleNamespace(attention_backend=AttentionBackendType.SDPA)
     )
+    monkeypatch.setattr(xfuser_qwenimage21, "get_ulysses_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(xfuser_qwenimage21, "get_sequence_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(xfuser_qwenimage21, "get_sequence_parallel_rank", lambda: 0)
     calls = []
     real_attention = xfuser_qwenimage21.attention
 
@@ -109,6 +112,26 @@ def test_padded_prompt_decode_falls_back_to_diffusers(xfuser_sdpa_calls):
     actual = _prefill_then_decode(model, encoder_hidden_states_mask=mask)
 
     assert xfuser_sdpa_calls == []
+    for ref, out in zip(reference, actual):
+        torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "processor_name",
+    ["xFuserQwenImage21AttnProcessor", "xFuserQwenImage21FlexAttnProcessor"],
+)
+def test_wrapper_forward_matches_diffusers(xfuser_sdpa_calls, processor_name):
+    """The wrapper copies diffusers' forward; at Ulysses degree 1 it must match it exactly."""
+    if processor_name == "xFuserQwenImage21FlexAttnProcessor" and not qwenimage21._FLEX_AVAILABLE:
+        pytest.skip("flex_attention unavailable")
+    stock = _tiny_model()
+    reference = _prefill_then_decode(stock)
+
+    wrapper = xfuser_qwenimage21.xFuserQwenImage21TransformerWrapper.from_config(stock.config).eval()
+    wrapper.load_state_dict(stock.state_dict())
+    _set_processor(wrapper, getattr(xfuser_qwenimage21, processor_name))
+    actual = _prefill_then_decode(wrapper)
+
     for ref, out in zip(reference, actual):
         torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-5)
 
