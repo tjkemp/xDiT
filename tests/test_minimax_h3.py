@@ -233,6 +233,27 @@ def test_minimax_h3_publishes_the_trailing_pad_length(monkeypatch):
     assert set(wrapper._usp_attention_kwargs) == aligned_keys
 
 
+def test_minimax_h3_registers_ulysses_attention_for_fp8_comms():
+    from xfuser.core.attention.spec import AttentionBackendType
+    from xfuser.core.distributed.fp8_comms import resolve_fp8_comms_eligible_modules
+    from xfuser.model_executor.models.transformers.transformer_minimax_h3 import (
+        xFuserMiniMaxH3Transformer3DWrapper,
+    )
+
+    wrapper = xFuserMiniMaxH3Transformer3DWrapper(
+        **_tiny_config(),
+        attention_backend=AttentionBackendType.AITER_FP8,
+    )
+
+    eligible = resolve_fp8_comms_eligible_modules(wrapper)
+    assert eligible == [block.attn for block in wrapper.transformer_blocks]
+    refiner_attention = [
+        block.attn for block in wrapper.token_refiner.refiner_blocks
+    ]
+    assert refiner_attention
+    assert all(attn not in eligible for attn in refiner_attention)
+
+
 def test_minimax_h3_wrapper_exposes_diffusers_config_signature():
     from xfuser.model_executor.models.transformers.transformer_minimax_h3 import (
         xFuserMiniMaxH3Transformer3DWrapper,
@@ -1382,7 +1403,9 @@ def test_minimax_h3_supports_hybrid_attention_capability():
     )
 
     assert xFuserMiniMaxH3Model.capabilities.use_hybrid_attn_schedule
+    assert xFuserMiniMaxH3Model.capabilities.use_fp8_comms
     assert xFuserMiniMaxH3Ref2VAModel.capabilities.use_hybrid_attn_schedule
+    assert xFuserMiniMaxH3Ref2VAModel.capabilities.use_fp8_comms
     assert (
         xFuserMiniMaxH3Model.default_input_values.num_hybrid_attn_high_precision_steps
         == 5
