@@ -1258,6 +1258,26 @@ def _validate_aiter_mha_v4_request(dropout_p, is_causal, attention_kwargs=None):
         raise NotImplementedError("MHA v4 does not support causal masking")
 
 
+def _slice_fp8_comms_trailing_pad(key, value, attention_kwargs):
+    """Shorten K/V when FP8 comms quantized a trailing pad along with the real keys.
+
+    The rows are already FP8, so the varlen pack cannot drop them without a
+    second gather. ``valid_kv_len`` says the pad is a suffix: keeping every
+    query and slicing K/V is the masked result. An interior mask has no such
+    slice, and dense attention would otherwise score the padded keys.
+    """
+    kwargs = attention_kwargs or {}
+    if kwargs.get("indices_k") is None:
+        return key, value
+    if kwargs.get("valid_kv_len") is None:
+        raise NotImplementedError(
+            "fp8 comms pre-quantized attention does not support varlen packing; "
+            "the indices_k mask would be silently dropped and dense attention would "
+            "run over padded keys."
+        )
+    return _trim_mha_v4_trailing_pad(key, value, attention_kwargs)
+
+
 def _trim_mha_v4_trailing_pad(key, value, attention_kwargs):
     """Slice a declared trailing K/V pad so dense MHA v4 can serve a padded request.
 
@@ -1321,19 +1341,17 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     attention_kwargs = attention_kwargs or {}
     pre_quantized = attention_kwargs.get("pre_quantized", False)
 
+    if pre_quantized:
+        # Q/K/V arrive already FP8 from fp8 comms (quantized before the Ulysses
+        # all-to-all). Slice while the sequence is still dim 2; the permute
+        # below moves it to dim 1.
+        key, value = _slice_fp8_comms_trailing_pad(key, value, attention_kwargs)
+
     query = torch.permute(query, [0, 2, 1, 3]).contiguous()
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
 
     if pre_quantized:
-        # Q/K/V arrive already FP8 from fp8 comms (quantized before the Ulysses
-        # all-to-all).
-        if (attention_kwargs or {}).get("indices_k") is not None:
-            raise NotImplementedError(
-                "fp8 comms pre-quantized attention does not support varlen packing; "
-                "the indices_k mask would be silently dropped and dense attention would "
-                "run over padded keys."
-            )
         softmax_scale = query.shape[-1] ** -0.5
         if _use_aiter_mha_v4_fp8(query, is_causal):
             fp8_format = _aiter_native_fp8_format()
@@ -2803,12 +2821,7 @@ def _aiter_flydsl_attn_call(query, key, value, dropout_p, is_causal, attention_k
 def _aiter_flydsl_fp8_prequant_call(query, key, value, dropout_p, is_causal, attention_kwargs):
     """FlyDSL fp8 attention on Q/K/V that fp8 comms already quantized (and rotated)."""
     _validate_aiter_low_precision_dropout(dropout_p)
-    if attention_kwargs.get("indices_k") is not None:
-        raise NotImplementedError(
-            "fp8 comms pre-quantized attention does not support varlen packing; "
-            "the indices_k mask would be silently dropped and dense attention would "
-            "run over padded keys."
-        )
+    key, value = _slice_fp8_comms_trailing_pad(key, value, attention_kwargs)
     query = torch.permute(query, [0, 2, 1, 3]).contiguous()
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()

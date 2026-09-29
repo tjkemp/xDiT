@@ -141,6 +141,80 @@ def test_aiter_fp8_legacy_attention_retains_qk_rotation(monkeypatch):
     assert torch.equal(calls["key"], expected_key)
 
 
+def test_prequantized_fp8_slices_a_trailing_pad(monkeypatch):
+    from xfuser.core.distributed import attention_backend
+
+    calls = {}
+
+    def packed(query, key, value, *args, **kwargs):
+        calls["query"] = query
+        calls["key"] = key
+        calls["value"] = value
+        return query
+
+    monkeypatch.setattr(attention_backend, "_use_aiter_mha_v4_fp8", lambda *_: True)
+    monkeypatch.setattr(attention_backend, "_aiter_native_fp8_format", lambda: 4)
+    monkeypatch.setattr(
+        attention_backend,
+        "_AiterAttentionScaleMode",
+        SimpleNamespace(F32_PER_TENSOR=1),
+    )
+    monkeypatch.setattr(attention_backend, "_aiter_mha_v4_packed", packed)
+
+    query = torch.randn(1, 2, 8, 128)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    scale = torch.ones(1)
+    output, lse = attention_backend._aiter_fp8_attn_call(
+        query,
+        key,
+        value,
+        dropout_p=0.0,
+        is_causal=False,
+        attention_kwargs={
+            "pre_quantized": True,
+            "q_descale": scale,
+            "k_descale": scale,
+            "v_descale": scale,
+            "indices_k": torch.arange(5),
+            "cu_seqlens_k": torch.tensor([0, 5], dtype=torch.int32),
+            "max_seqlen_k": 5,
+            "valid_kv_len": 5,
+        },
+    )
+
+    assert lse is None
+    assert calls["query"].shape == (1, 8, 2, 128)
+    assert calls["key"].shape == (1, 5, 2, 128)
+    assert calls["value"].shape == (1, 5, 2, 128)
+    assert torch.equal(output, query)
+
+
+def test_prequantized_fp8_refuses_an_interior_key_mask():
+    import pytest
+    from xfuser.core.distributed import attention_backend
+
+    query = torch.randn(1, 2, 8, 128)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    scale = torch.ones(1)
+    with pytest.raises(NotImplementedError, match="varlen packing"):
+        attention_backend._aiter_fp8_attn_call(
+            query,
+            key,
+            value,
+            dropout_p=0.0,
+            is_causal=False,
+            attention_kwargs={
+                "pre_quantized": True,
+                "q_descale": scale,
+                "k_descale": scale,
+                "v_descale": scale,
+                "indices_k": torch.tensor([0, 2, 4]),
+            },
+        )
+
+
 def test_aiter_fp8_compiles_without_dtype_rewrite(monkeypatch):
     from xfuser.core.distributed import attention_backend
 
