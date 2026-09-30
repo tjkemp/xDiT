@@ -325,14 +325,22 @@ def _recipe_operands(recipe):
     return _AITER.operands(qk_format, qk_format, v_format, qk_scale, qk_scale, v_scale)
 
 
-def check_sol_attn_supported(query, key, value, is_causal, ring_world_size=1, recipe=None):
+def check_sol_attn_supported(query, key, value, is_causal, ring_world_size=1, recipe=None,
+                             pre_quantized=False):
     """Validate the per-call constraints aiter's Sol-Attn contract does not already cover.
 
     `recipe` narrows the block-tile check to the row this call will actually dispatch on, which is
     what sol_attn_bhsd passes. Left None it falls back to asking whether any precision serves the
     tile, for a caller that has not resolved a recipe yet.
+
+    pre_quantized expects the fp8 codes fp8 comms sent in place of bf16 Q/K/V.
     """
-    if not query.dtype == key.dtype == value.dtype == torch.bfloat16:
+    if pre_quantized:
+        if not (query.dtype == key.dtype == value.dtype and _is_fp8(query)):
+            raise SolAttnUnsupported(
+                f"pre-quantized Sol-Attn takes fp8 Q/K/V, got q={query.dtype} k={key.dtype} "
+                f"v={value.dtype}.")
+    elif not query.dtype == key.dtype == value.dtype == torch.bfloat16:
         raise SolAttnUnsupported(
             f"Sol-Attn's mha_v4 row takes bf16 Q/K/V and returns bf16, got q={query.dtype} "
             f"k={key.dtype} v={value.dtype}. Select another attention backend for other dtypes.")
@@ -536,8 +544,26 @@ def _pad_kv_to_tile(key, value, kv_tile):
         return key, value
     # BSHD, so the seqlen axis is the second of four and F.pad counts from the last.
     widths = (0, 0, 0, 0, 0, pad)
-    return (torch.nn.functional.pad(key, widths),
-            torch.nn.functional.pad(value, widths))
+    return (_from_bytes(torch.nn.functional.pad(_as_bytes(key), widths), key.dtype),
+            _from_bytes(torch.nn.functional.pad(_as_bytes(value), widths), value.dtype))
+
+
+def _is_fp8(tensor):
+    return tensor.is_floating_point() and tensor.element_size() == 1
+
+
+def _as_bytes(tensor):
+    """An fp8 tensor as uint8 codes, anything else unchanged.
+
+    index_select and constant_pad_nd have no fp8 kernels on every torch build. The byte view moves
+    the same codes, and a zero byte is +0.0 in both e4m3fn and e4m3fnuz, so a zero pad is still a
+    zero key after the kernel descales it.
+    """
+    return tensor.view(torch.uint8) if _is_fp8(tensor) else tensor
+
+
+def _from_bytes(tensor, dtype):
+    return tensor.view(dtype) if tensor.dtype != dtype else tensor
 
 
 @functools.cache
@@ -577,7 +603,7 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
                   routing=None, ring_world_size=1, dump_path=None,
                   return_head_cost=False, recipe="fp8", key_seqlen=None,
                   exact_tokens=None, sequence_permutation=None,
-                  sequence_inverse_permutation=None):
+                  sequence_inverse_permutation=None, descales=None):
     """Sol-Attn over BHSD tensors, returning (BHSD bf16 output, per-head cost or None).
 
     query/key/value are (batch, nheads, seqlen, head_dim) bf16 tensors. They are permuted into the
@@ -610,12 +636,21 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
     sequence_inverse_permutation restores the query rows on return. This is used by MiniMax-H3 to
     make spatially adjacent video tokens share blocks while leaving its external packed-row
     contract unchanged.
+
+    descales, a (q, k, v) triple of float32 per-tensor descales, says query/key/value are already
+    fp8 codes, as fp8 comms sends them: Q/K Hadamard-rotated, V not. Only the fp8 recipe takes
+    them, and nothing is quantized here. The rotation need not be aiter's own: any orthonormal
+    one applied to both Q and K leaves the scores and the pooled block means unchanged. Routing
+    runs on these same codes, so it sees exactly the K the kernel reads.
     """
     if _AITER is None:
         raise SolAttnUnsupported(
             "Sol-Attn requires aiter with mha_v4_sol_attn and sol_attn_prepare; "
             "please update AITER")
     recipe = _resolve_recipe(recipe)
+    if descales is not None and recipe.id != "fp8":
+        raise SolAttnUnsupported(
+            f"pre-quantized Sol-Attn serves only the per-tensor fp8 recipe, got {recipe.id!r}.")
     # Resolved once and threaded, not re-read at each site. The answer is per recipe now, and the
     # LUT, the bitmap, the pooled K/V and the tile pad all have to be cut to the same one.
     block_tile = sol_attn_block_tile(recipe)
@@ -634,9 +669,10 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
             )
         if sequence_inverse_permutation is None:
             sequence_inverse_permutation = torch.argsort(sequence_permutation)
-        query = query.index_select(2, sequence_permutation)
-        key = key.index_select(2, sequence_permutation)
-        value = value.index_select(2, sequence_permutation)
+        query, key, value = (
+            _from_bytes(_as_bytes(tensor).index_select(2, sequence_permutation), tensor.dtype)
+            for tensor in (query, key, value)
+        )
         if exact_tokens is not None:
             exact_tokens = exact_tokens.index_select(0, sequence_permutation)
 
@@ -651,7 +687,8 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
         return out
 
     check_sol_attn_supported(
-        query, key, value, is_causal, ring_world_size=ring_world_size, recipe=recipe
+        query, key, value, is_causal, ring_world_size=ring_world_size, recipe=recipe,
+        pre_quantized=descales is not None,
     )
     _maybe_dump(dump_path, query, key, value)
     # Before the tile pad, so the two do not stack: the caller's alignment is dropped and only the
@@ -672,7 +709,7 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
     # The raw entrypoint routes internally from beta alone, so it cannot be told about forced
     # blocks any more than it can be asked for the head cost.
     if (routing is None and not return_head_cost and force_blocks is None
-            and recipe.routes_through_raw):
+            and descales is None and recipe.routes_through_raw):
         qk, v_fmt = _format(recipe.qk_format), _format(recipe.v_format)
         out = _AITER.sol_attn(query, key, value, qk, qk, v_fmt, beta=beta,
                               softmax_scale=softmax_scale,
@@ -705,7 +742,11 @@ def sol_attn_bhsd(query, key, value, is_causal=False, beta=1.0, softmax_scale=No
     # outliers that dominate fp8 error, and V is not rotated because nothing cancels a rotation of
     # it. Reusing aiter's fused rotation rather than doing a second one here is what keeps this path
     # numerically identical to the raw one, so asking for the head cost cannot change the output.
-    q, k, v = _quantize(recipe, query, key, value, softmax_scale)
+    if descales is None:
+        q, k, v = _quantize(recipe, query, key, value, softmax_scale)
+    else:
+        q, k, v = ((tensor, descale, None)
+                   for tensor, descale in zip((query, key, value), descales, strict=True))
     if routing is None:
         routing = sol_attn_routing_for(q, k, v, beta, recipe, force_blocks=force_blocks)
     qk_fmt, v_fmt = _format(recipe.qk_format), _format(recipe.v_format)

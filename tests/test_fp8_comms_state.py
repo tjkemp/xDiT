@@ -176,7 +176,7 @@ def test_rotation_shrinks_outlier_amax():
 
 
 def test_rotation_is_a_noop_for_backends_that_do_not_rotate():
-    # AITER_FP8 and AITER_FLYDSL_FP8 rotate; any other backend returns the
+    # The pre-quantizing backends rotate; any other backend returns the
     # inputs untouched, so the head_dim never reaches the rotation and device
     # does not matter here.
     q, k = _outlier_qk(head_dim=8, seq=4, device="cpu")
@@ -184,13 +184,17 @@ def test_rotation_is_a_noop_for_backends_that_do_not_rotate():
     assert q_out is q and k_out is k
 
 
-def test_flydsl_fp8_rotates_like_aiter_fp8():
+@pytest.mark.parametrize(
+    "backend",
+    [AttentionBackendType.AITER_FLYDSL_FP8, AttentionBackendType.AITER_FP8_SOL],
+)
+def test_pre_quantizing_backends_rotate_like_aiter_fp8(backend):
     q, k = _outlier_qk()
     q_aiter, k_aiter = rotate_qk_for_fp8_comms(q, k, AttentionBackendType.AITER_FP8)
-    q_fly, k_fly = rotate_qk_for_fp8_comms(q, k, AttentionBackendType.AITER_FLYDSL_FP8)
-    torch.testing.assert_close(q_fly, q_aiter)
-    torch.testing.assert_close(k_fly, k_aiter)
-    assert q_fly.abs().amax() < q.abs().amax()
+    q_other, k_other = rotate_qk_for_fp8_comms(q, k, backend)
+    torch.testing.assert_close(q_other, q_aiter)
+    torch.testing.assert_close(k_other, k_aiter)
+    assert q_other.abs().amax() < q.abs().amax()
 
 
 def test_calibration_that_measures_nothing_raises():

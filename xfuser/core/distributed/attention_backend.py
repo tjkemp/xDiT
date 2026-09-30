@@ -819,6 +819,7 @@ def _mha_v4_sparge_tile():
 SUPPORTS_PRE_QUANTIZATION_BACKENDS = {
     AttentionBackendType.AITER_FP8,
     AttentionBackendType.AITER_FLYDSL_FP8,
+    AttentionBackendType.AITER_FP8_SOL,
 }
 
 
@@ -1093,10 +1094,7 @@ def rotate_qk_for_fp8_comms(query, key, backend):
     both must measure and quantize the same distribution, otherwise the frozen
     per-layer scale describes a tensor that is never quantized.
     """
-    if backend not in (
-        AttentionBackendType.AITER_FP8,
-        AttentionBackendType.AITER_FLYDSL_FP8,
-    ):
+    if backend not in SUPPORTS_PRE_QUANTIZATION_BACKENDS:
         return query, key
     R = _get_fp8_hadamard_matrix(query.shape[-1], query.device)
     return (
@@ -1871,6 +1869,11 @@ def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     exact_tokens = kwargs.get(SOL_EXACT_TOKENS_KEY)
     sequence_permutation = kwargs.get(SOL_SEQUENCE_PERMUTATION_KEY)
     sequence_inverse_permutation = kwargs.get(SOL_SEQUENCE_INVERSE_PERMUTATION_KEY)
+    descales = (
+        (kwargs["q_descale"], kwargs["k_descale"], kwargs["v_descale"])
+        if kwargs.get("pre_quantized", False)
+        else None
+    )
 
     # Drop a caller's trailing query pad before anything pools it, the way _vsa_h3_attn_call
     # already does for the other query-tiling backend. Both sides are sliced here rather than
@@ -1912,6 +1915,7 @@ def _aiter_sol_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
         exact_tokens=exact_tokens,
         sequence_permutation=sequence_permutation,
         sequence_inverse_permutation=sequence_inverse_permutation,
+        descales=descales,
     )
     if cost_sink is not None:
         cost_sink.copy_(head_cost)

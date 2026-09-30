@@ -806,6 +806,75 @@ def test_sol_attn_publishes_a_head_cost_without_changing_the_output(monkeypatch)
     assert (cost_sink <= num_q_tiles * num_kv_blocks).all()
 
 
+def _fp8_comms_operands(query, key, value):
+    """BHSD fp8 codes and descales quantized the way the fp8 recipe itself would."""
+    from xfuser.core.sparge_attention import sol
+
+    (q, q_descale), (k, k_descale) = (
+        sol._AITER.quantize_fp8_rotated(tensor.contiguous()) for tensor in (query, key)
+    )
+    v, v_descale = sol._AITER.quantize_fp8(value.contiguous())
+    return (q, k, v), (q_descale, k_descale, v_descale)
+
+
+def test_pre_quantized_sol_attn_reproduces_the_packed_path():
+    """Codes quantized before the all-to-all must give what quantizing inside the backend gives.
+
+    The head-cost request pins the in-backend call to the packed entry point the pre-quantized
+    one always takes, so the only difference left is where the same quantizers ran.
+    """
+    _require_sol_attn()
+
+    from xfuser.core.sparge_attention.sol import sol_attn_bhsd
+
+    query, key, value = _operands()
+    operands, descales = _fp8_comms_operands(query, key, value)
+    with torch.no_grad():
+        reference, reference_cost = sol_attn_bhsd(
+            query, key, value, beta=0.5, return_head_cost=True
+        )
+        pre_quantized, cost = sol_attn_bhsd(
+            *operands, beta=0.5, return_head_cost=True, descales=descales
+        )
+
+    assert torch.equal(pre_quantized, reference)
+    assert torch.equal(cost, reference_cost)
+
+
+def test_pre_quantized_sol_attn_drops_a_nonzero_alignment_pad():
+    """fp8 comms sends MiniMax-H3's pad rows too, and there they are not zero.
+
+    The trim and the zero tile pad have to work on fp8 codes, so dropping the pad must match
+    handing over only the real keys quantized under the same scale.
+    """
+    _require_sol_attn()
+
+    from xfuser.core.sparge_attention.sol import sol_attn_bhsd
+
+    real, align = 3970, 64
+    padded = -(-real // align) * align
+    query, key, value = _operands(seqlen=padded)
+    (q, k, v), descales = _fp8_comms_operands(query, key, value)
+    with torch.no_grad():
+        dropped, _ = sol_attn_bhsd(q, k, v, beta=0.5, key_seqlen=real, descales=descales)
+        unpadded, _ = sol_attn_bhsd(
+            q, k[:, :, :real], v[:, :, :real], beta=0.5, descales=descales
+        )
+
+    assert torch.equal(dropped, unpadded)
+
+
+def test_pre_quantized_sol_attn_refuses_other_recipes():
+    _require_sol_attn()
+
+    from xfuser.core.sparge_attention.sol import SolAttnUnsupported, sol_attn_bhsd
+
+    query, key, value = _operands()
+    operands, descales = _fp8_comms_operands(query, key, value)
+    with pytest.raises(SolAttnUnsupported, match="fp8 recipe"):
+        sol_attn_bhsd(*operands, recipe="i8fp8", descales=descales)
+
+
 @pytest.mark.parametrize(
     ("recipe", "dense_backend"),
     [("bf16", "AITER_BF16"), ("bf16fp8", "AITER_BF16FP8"),
