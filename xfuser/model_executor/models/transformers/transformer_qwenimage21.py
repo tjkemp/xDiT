@@ -117,10 +117,13 @@ def _segmented_prefill(query, key, value, segments, key_valid):
     return torch.cat(outputs, dim=1)
 
 
-def _xfuser_attention(query, key, value):
-    return attention(
-        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), dropout_p=0.0, is_causal=False
-    ).transpose(1, 2)
+def flex_attention_available() -> bool:
+    """Whether ``torch.nn.attention.flex_attention`` imports (torch >= 2.5)."""
+    try:
+        import torch.nn.attention.flex_attention  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 class _xFuserQwenImage21AttnMixin:
@@ -132,6 +135,15 @@ class _xFuserQwenImage21AttnMixin:
 
     Subclassing the diffusers processors, rather than wrapping them, matters: the model picks which prefill
     metadata to build from ``isinstance`` checks against them.
+
+    Prefill and decode then diverge in this ``__call__``:
+
+    * Eager processor (not a ``QwenImage21FlexAttnProcessor``): step 0 arrives with ``segments`` and no
+      ``BlockMask``. ``_segmented_prefill`` calls diffusers' ``dispatch_attention_fn``, which is SDPA.
+    * Flex processor, installed only when ``flex_attention_available()`` and the model is compiled: step 0
+      arrives as one ``BlockMask``. ``_flex_prefill`` calls ``dispatch_attention_fn(..., backend="flex")``.
+    * Decode is the same for both. No mask and no segments, so the call goes through xDiT's ``attention()``
+      and ``--attention_backend`` applies. A prompt padding mask stays on ``dispatch_attention_fn``.
     """
 
     # Padding appended to make the sequence divisible by the Ulysses degree. The block's forward has no
@@ -168,7 +180,14 @@ class _xFuserQwenImage21AttnMixin:
         elif segments is not None:
             hidden_states = _segmented_prefill(query, key, value, segments, key_valid)
         elif attention_mask is None:
-            hidden_states = _xfuser_attention(query, key, value)
+            # xDiT attention() is [B, H, S, D]; this processor holds [B, S, H, D].
+            hidden_states = attention(
+                query.transpose(1, 2),
+                key.transpose(1, 2),
+                value.transpose(1, 2),
+                dropout_p=0.0,
+                is_causal=False,
+            ).transpose(1, 2)
         else:
             hidden_states = dispatch_attention_fn(query, key, value, attn_mask=attention_mask, dropout_p=0.0)
 

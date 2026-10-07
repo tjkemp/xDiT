@@ -6,7 +6,9 @@ pytest.importorskip(
     reason="installed diffusers does not include Qwen-Image-2.1",
 )
 
-from xfuser.model_executor.models.runner_models.qwen import _qwen_image21_output_size
+from xfuser.model_executor.models.runner_models.qwen import xFuserQwenImage21Model
+
+_qwen_image21_output_size = xFuserQwenImage21Model._qwen_image21_output_size
 
 
 def test_explicit_size_wins_over_images():

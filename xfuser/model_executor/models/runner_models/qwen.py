@@ -13,18 +13,15 @@ from xfuser.model_executor.models.runner_models.base_model import (
     DiffusionOutput,
     ModelSettings,
     DIFFUSERS_FROM_SOURCE,
-    _parse_attention_backend,
 )
 from xfuser import xFuserArgs
 from xfuser.core.distributed import get_runtime_state
-from xfuser.core.attention.spec import AttentionBackendType
 from xfuser.core.utils.runner_utils import log
 from xfuser.model_executor.models.runner_models.loading.contracts import (
     LoadSupport,
     STANDARD_LOAD_ROUTES,
 )
 
-_QWEN_IMAGE_21_UNSUPPORTED_ATTENTION_BACKENDS = frozenset({AttentionBackendType.FLEX_VSA_H3})
 _QWEN_IMAGE_21_NUM_HEADS = 32
 
 @register_model("Qwen/Qwen-Image-Edit-2511")
@@ -230,22 +227,6 @@ class xFuserQwenImageModel(xFuserModel):
         return DiffusionOutput(images=output.images, pipe_args=input_args)
 
 
-def _qwen_image21_output_size(images, height, width, resolution=1024):
-    """Output (height, width): explicit when given, else the last condition image's aspect
-    ratio at ``resolution**2`` area -- what QwenImage21Pipeline picks itself -- else square."""
-    if height is not None and width is not None:
-        return height, width
-    if height is not None or width is not None:
-        raise ValueError("Qwen-Image-2.1 needs both --height and --width, or neither.")
-    if images:
-        from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import calculate_dimensions
-
-        image_width, image_height = images[-1].size
-        width, height, _ = calculate_dimensions(resolution * resolution, image_width / image_height)
-        return height, width
-    return resolution, resolution
-
-
 @register_model("Qwen/Qwen-Image-2.1")
 @register_model("Qwen-Image-2.1")
 class xFuserQwenImage21Model(xFuserModel):
@@ -313,10 +294,31 @@ class xFuserQwenImage21Model(xFuserModel):
         )
         return pipe
 
+    @staticmethod
+    def _qwen_image21_output_size(images, height, width, resolution=1024):
+        """Output (height, width): explicit when given, else the last condition image's aspect
+        ratio at ``resolution**2`` area -- what QwenImage21Pipeline picks itself -- else square.
+
+        The ``calculate_dimensions`` import stays inside this class. A module-level helper
+        would make the floor audit treat that unreleased symbol as a requirement of every
+        model in this file, including the released Qwen-Image pipelines.
+        """
+        if height is not None and width is not None:
+            return height, width
+        if height is not None or width is not None:
+            raise ValueError("Qwen-Image-2.1 needs both --height and --width, or neither.")
+        if images:
+            from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import calculate_dimensions
+
+            image_width, image_height = images[-1].size
+            width, height, _ = calculate_dimensions(resolution * resolution, image_width / image_height)
+            return height, width
+        return resolution, resolution
+
     def _preprocess_args_images(self, input_args: dict) -> dict:
         input_args = super()._preprocess_args_images(input_args)
         explicit = input_args.get("height") is not None and input_args.get("width") is not None
-        height, width = _qwen_image21_output_size(
+        height, width = self._qwen_image21_output_size(
             input_args["input_images"], input_args.get("height"), input_args.get("width")
         )
         input_args["height"], input_args["width"] = height, width
@@ -340,12 +342,6 @@ class xFuserQwenImage21Model(xFuserModel):
 
     def _validate_config(self, config: xFuserArgs) -> None:
         super()._validate_config(config)
-        backend = _parse_attention_backend(config.attention_backend, "attention backend")
-        if backend in _QWEN_IMAGE_21_UNSUPPORTED_ATTENTION_BACKENDS:
-            raise ValueError(
-                f"Model {self.settings.model_name} does not support attention backend {backend.name}: "
-                f"its decode attention is plain dense attention and cannot supply the backend's extra inputs."
-            )
         ulysses_degree = config.ulysses_degree or 1
         if _QWEN_IMAGE_21_NUM_HEADS % ulysses_degree:
             raise ValueError(
@@ -359,24 +355,23 @@ class xFuserQwenImage21Model(xFuserModel):
     def _compile_model(self, input_args: dict) -> None:
         # flex_attention is only efficient compiled, so the one-call prefill is set up here, not at load.
         from xfuser.model_executor.models.transformers.transformer_qwenimage21 import (
+            flex_attention_available,
             xFuserQwenImage21FlexAttnProcessor,
         )
-        blocks = self.pipe.transformer.transformer_blocks
-        try:
+
+        if flex_attention_available():
+            blocks = self.pipe.transformer.transformer_blocks
             for block in blocks:
                 block.attn.set_processor(xFuserQwenImage21FlexAttnProcessor())
-            log(
-                f"Qwen-Image-2.1: block-causal prefill uses flex_attention on {len(blocks)} "
-                f"blocks."
-            )
-        except ImportError as exc:
-            log(
-                f"Qwen-Image-2.1: flex_attention unavailable ({exc}); block-causal prefill "
-                f"uses per-segment SDPA."
-            )
+            log(f"Qwen-Image-2.1: block-causal prefill uses flex_attention on {len(blocks)} blocks.")
+        else:
+            log("Qwen-Image-2.1: flex_attention unavailable; block-causal prefill uses per-segment SDPA.")
         super()._compile_model(input_args)
 
     def _run_pipe(self, input_args: dict) -> DiffusionOutput:
+        # Passed through on purpose. The pipeline enables classifier-free guidance
+        # only when this is greater than 1 and a negative prompt is set; the default
+        # of 1.0 is the unguided sampling 2.1 is meant to use.
         true_cfg_scale = input_args["guidance_scale"]
         kwargs = {
             "prompt": input_args["prompt"],
