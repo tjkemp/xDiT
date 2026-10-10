@@ -23,6 +23,7 @@ from xfuser.core.distributed import (
 from xfuser.core.attention import registry as attention_registry
 from xfuser.core.attention.spec import Sparsity
 from xfuser.core.attention.backends.vsa_h3.attention import build_h3_vsa_metadata
+from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_modules
 from xfuser.model_executor.layers.usp import (
     ULYSSES_EXTRA_INPUTS_KEY,
     USP,
@@ -230,6 +231,11 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
                     use_fasth3_vsa=enable_fasth3_vsa,
                 )
             )
+        # The token refiner attention is local, so it has no Ulysses exchange
+        # to quantize.
+        register_fp8_comms_eligible_modules(
+            self, [block.attn for block in self.transformer_blocks]
+        )
 
         self.register_forward_pre_hook(
             lambda module, args: get_runtime_state().increment_step_counter()

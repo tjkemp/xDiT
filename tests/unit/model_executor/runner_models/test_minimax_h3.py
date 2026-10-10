@@ -1421,6 +1421,57 @@ def test_minimax_h3_rejects_unsupported_hybrid_backend():
         xFuserMiniMaxH3Model(config)
 
 
+@pytest.mark.parametrize(
+    ("model", "task"),
+    [
+        ("MiniMax-H3", "t2va"),
+        ("MiniMax-H3-Ref2VA", "ref2va"),
+        ("FastH3", "t2va"),
+        ("FastH3-Dense", "t2va"),
+        ("FastVideo/FastVideo-FastH3-8-Step-V2", "t2va"),
+    ],
+)
+def test_minimax_h3_variants_accept_fp8_comms(monkeypatch, model, task):
+    from xfuser.config import xFuserArgs
+    from xfuser.model_executor.models.runner_models import minimax_h3  # noqa: F401
+    from xfuser.model_executor.models.runner_models.base_model import MODEL_REGISTRY
+
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    aiter = types.ModuleType("aiter")
+    aiter.flash_attn_varlen_fp8_pertensor_func = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "aiter", aiter)
+
+    config = xFuserArgs(
+        model=model,
+        task=task,
+        attention_backend="AITER_FP8",
+        ulysses_degree=2,
+        use_fp8_comms=True,
+    )
+
+    MODEL_REGISTRY[model](config)
+
+
+def test_minimax_h3_registers_only_ulysses_attention_for_fp8_comms():
+    from xfuser.core.attention.spec import AttentionBackendType
+    from xfuser.core.distributed.fp8_comms import resolve_fp8_comms_eligible_modules
+    from xfuser.model_executor.models.transformers.transformer_minimax_h3 import (
+        xFuserMiniMaxH3Transformer3DWrapper,
+    )
+
+    wrapper = xFuserMiniMaxH3Transformer3DWrapper(
+        **_tiny_config(),
+        attention_backend=AttentionBackendType.AITER_FP8,
+    )
+
+    eligible = resolve_fp8_comms_eligible_modules(wrapper)
+    assert eligible == [block.attn for block in wrapper.transformer_blocks]
+    refiner_attention = [block.attn for block in wrapper.token_refiner.refiner_blocks]
+    assert refiner_attention
+    assert all(attn not in eligible for attn in refiner_attention)
+
+
 def test_minimax_h3_forward_increments_hybrid_step_counter(monkeypatch):
     from xfuser.model_executor.models.transformers import transformer_minimax_h3
     from xfuser.model_executor.models.transformers.transformer_minimax_h3 import (

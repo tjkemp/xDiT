@@ -382,6 +382,7 @@ class xFuserMiniMaxH3Model(xFuserModel):
         fully_shard_degree=True,
         use_fp8_gemms=True,
         use_fp4_gemms=True,
+        use_fp8_comms=True,
         use_hybrid_attn_schedule=True,
         enable_slicing=False,
         enable_tiling=False,
