@@ -15,7 +15,6 @@ from diffusers.models.transformers.transformer_qwenimage21 import (
     QwenImage21KVLayerCache,
     QwenImage21Transformer2DModel,
     _qwenimage21_prefix_segments,
-    apply_rotary_emb_qwen,
     build_qwenimage21_block_causal_mask,
 )
 from diffusers.utils.peft_utils import apply_lora_scale
@@ -52,6 +51,25 @@ def _scatter_sequence_gather_heads(hidden_states, sp_pad):
     if sp_pad:
         hidden_states = F.pad(hidden_states, (0, 0, 0, 0, 0, sp_pad))
     return _ft_c_output_all_to_all(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+
+def _rotary_table(freqs):
+    """``[S, D/2]`` complex rotary table -> ``[S, 2, D]`` (cos, signed sin) for ``_apply_rotary_emb``."""
+    cos = freqs.real.repeat_interleave(2, dim=-1)
+    sin = torch.stack([-freqs.imag, freqs.imag], dim=-1).flatten(-2)
+    return torch.stack([cos, sin], dim=1)
+
+
+def _apply_rotary_emb(x, rotary_emb):
+    """diffusers' ``apply_rotary_emb_qwen(..., use_real=False)`` in real arithmetic, which Inductor can compile.
+
+    Each feature pair ``(2k, 2k+1)`` of ``x`` ``[B, S, H, D]`` rotates by angle ``k``, which is
+    ``x * cos + swap_pairs(x) * signed_sin``. Inductor fuses this form with the QK-norm into one kernel.
+    """
+    cos, sin = rotary_emb[:, None].unbind(-2)
+    x_float = x.float()
+    swapped = x_float.unflatten(-1, (-1, 2)).flip(-1).flatten(-2)
+    return (x_float * cos + swapped * sin).type_as(x)
 
 
 def _update_kv_cache(key, value, layer_cache, kv_cache_mode, cache_write_slice):
@@ -169,8 +187,8 @@ class _xFuserQwenImage21AttnMixin:
         query = attn.norm_q(query).to(value.dtype)
         key = attn.norm_k(key).to(value.dtype)
         if rotary_emb is not None:
-            query = apply_rotary_emb_qwen(query, rotary_emb, use_real=False)
-            key = apply_rotary_emb_qwen(key, rotary_emb, use_real=False)
+            query = _apply_rotary_emb(query, rotary_emb)
+            key = _apply_rotary_emb(key, rotary_emb)
 
         query, key, value = _gather_sequence_scatter_heads(query, key, value, self.sp_pad)
         key, value = _update_kv_cache(key, value, layer_cache, kv_cache_mode, cache_write_slice)
@@ -217,8 +235,8 @@ class xFuserQwenImage21TransformerWrapper(QwenImage21Transformer2DModel):
     they are the same group only because the runner keeps Ring off.
 
     ``forward`` is a copy of ``QwenImage21Transformer2DModel.forward`` as of diffusers ``bdc2bea``; only the
-    sharding block before the block loop, ``target_token_mask=block_modulation_mask`` and the gather after
-    it differ.
+    real-valued rotary table, the sharding block before the block loop, ``target_token_mask=block_modulation_mask``
+    and the gather after it differ.
     """
 
     @apply_lora_scale("attention_kwargs")
@@ -262,7 +280,7 @@ class xFuserQwenImage21TransformerWrapper(QwenImage21Transformer2DModel):
         joint_hidden_states = joint_hidden_states.repeat_interleave(repeats, dim=1)
         joint_hidden_states[:, image_pad_mask] = hidden_states
 
-        rotary_emb = self.pos_embed(img_shapes[0], image_pad_mask, device=hidden_states.device)
+        rotary_emb = _rotary_table(self.pos_embed(img_shapes[0], image_pad_mask, device=hidden_states.device))
         image_ids, target_token_mask = self.build_token_metadata(image_pad_mask, img_shapes[0])
 
         timestep = timestep.to(hidden_states.dtype)
