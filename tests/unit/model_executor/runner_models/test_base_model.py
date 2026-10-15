@@ -24,6 +24,23 @@ class _StubModel(base_model.xFuserModel):
         raise NotImplementedError
 
 
+@pytest.mark.parametrize("channels", [1, 3, 4])
+def test_images_to_pil_matches_diffusers_pil_output(channels):
+    torch = pytest.importorskip("torch")
+    np = pytest.importorskip("numpy")
+    from diffusers.image_processor import VaeImageProcessor
+
+    processor = VaeImageProcessor()
+    decoded = (torch.rand(2, channels, 9, 13, generator=torch.Generator().manual_seed(0)) * 2.2 - 1.1).bfloat16()
+
+    expected = processor.postprocess(decoded, output_type="pil")
+    actual = base_model.xFuserModel._images_to_pil(processor.postprocess(decoded, output_type="pt"))
+
+    assert [image.mode for image in actual] == [image.mode for image in expected]
+    for ours, theirs in zip(actual, expected):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
 def test_outputs_land_in_an_output_directory_that_did_not_exist(tmp_path):
     output_directory = tmp_path / "benchmark_results" / "run"
     model = _StubModel(xFuserArgs(model="test/model", output_directory=str(output_directory)))

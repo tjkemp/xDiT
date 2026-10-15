@@ -399,13 +399,14 @@ class xFuserQwenImage21Model(xFuserModel):
             "num_inference_steps": input_args["num_inference_steps"],
             "true_cfg_scale": true_cfg_scale,
             "generator": self._make_generator(input_args["seed"]),
+            "output_type": "pt",
         }
         negative_prompt = input_args.get("negative_prompt")
         if true_cfg_scale > 1 and negative_prompt:
             kwargs["negative_prompt"] = negative_prompt
 
         output = self.pipe(**kwargs)
-        return DiffusionOutput(images=output.images, pipe_args=input_args)
+        return DiffusionOutput(images=self._images_to_pil(output.images), pipe_args=input_args)
 
 
 @register_model("Qwen/Qwen-Image-2.1-Turbo")

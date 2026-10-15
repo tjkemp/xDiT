@@ -4,7 +4,7 @@ import copy
 import json
 import os
 from math import gcd
-from PIL.Image import Image
+from PIL.Image import Image, fromarray
 from typing import Callable, List, Optional, Tuple, Generator
 from dataclasses import dataclass, field
 from torch.profiler import profile, record_function, ProfilerActivity
@@ -1371,6 +1371,17 @@ class xFuserModel(abc.ABC):
         breaks when CPU offload runs the pipeline on cpu.
         """
         return torch.Generator(device=self.pipe._execution_device).manual_seed(seed)
+
+    @staticmethod
+    def _images_to_pil(images: torch.Tensor) -> List[Image]:
+        """PIL images from a pipeline's ``output_type="pt"`` batch, ``[B, C, H, W]`` in ``[0, 1]``.
+
+        Gives the same pixels as diffusers' ``output_type="pil"``, but quantizes to ``uint8`` and lays the
+        pixels out row by row on the device, so less crosses to the host and PIL needs no strided copy.
+        """
+        pixels = images.float().mul(255).round().clamp(0, 255).to(torch.uint8)
+        pixels = pixels.permute(0, 2, 3, 1).contiguous().cpu().numpy()
+        return [fromarray(p.squeeze(-1) if p.shape[-1] == 1 else p) for p in pixels]
 
     @abc.abstractmethod
     def _run_pipe(self, input_args: dict) -> DiffusionOutput:
