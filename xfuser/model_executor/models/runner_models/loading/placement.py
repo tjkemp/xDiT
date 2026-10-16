@@ -334,6 +334,7 @@ def _convert_int8_on_device(loader, local_rank) -> None:
         convert, filter_fn = conversion_filter(
             module_name,
             loader.quantization_ledger.streaming_targets,
+            include_suffixes=getattr(model.settings, "int8_gemm_include_suffixes", None),
         )
         if not convert:
             continue

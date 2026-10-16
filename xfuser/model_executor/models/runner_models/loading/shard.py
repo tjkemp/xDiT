@@ -313,7 +313,9 @@ def build_block_quantize_fn(
             adapter.convert_block(
                 block,
                 device=device,
-                filter_fn=_target_filter(local_int8_targets),
+                filter_fn=_target_filter(
+                    local_int8_targets, (), getattr(settings, "int8_gemm_include_suffixes", None)
+                ),
             )
 
     return quantize_fn

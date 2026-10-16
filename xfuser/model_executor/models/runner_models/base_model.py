@@ -256,6 +256,8 @@ class ModelSettings:
     # When set, FP4 mode quantizes only linears whose name ends with one of these; the rest of each
     # FP4 target stays in bf16 (the FP4 counterpart of fp8_gemm_include_suffixes).
     fp4_gemm_include_suffixes: Optional[Tuple[str, ...]] = None
+    # The INT8 counterpart of fp4_gemm_include_suffixes.
+    int8_gemm_include_suffixes: Optional[Tuple[str, ...]] = None
     fp8_precision_overrides: Tuple[str] = None
     fp8_precision_override_suffixes: Tuple[str] = None
     fbcache_thresh: float = 0.12

@@ -143,7 +143,7 @@ def _compile_vae_decoder(pipe, mode, dynamic) -> None:
     vae.decoder = torch.compile(decoder, mode=mode, dynamic=dynamic)
 
 
-# Linears that base Z-Image quantizes (FP8 or FP4); the rest of each block stays in bf16. Per-tensor FP8 on
+# Linears that base Z-Image quantizes (FP8, FP4 or INT8); the rest of each block stays in bf16. Per-tensor FP8 on
 # feed_forward.w2 destroys the output (random colour noise): its input, the SwiGLU product, carries outlier tokens
 # ~3500x the RMS, so one scale for the whole activation flushes the remaining tokens. adaLN_modulation (M=1, no
 # speedup) adds error for nothing.
@@ -222,6 +222,7 @@ class xFuserZImageModel(xFuserModel):
             "transformer.noise_refiner",
             "transformer.context_refiner"
         ],
+        int8_gemm_include_suffixes=_Z_IMAGE_QUANTIZED_SUFFIXES,
         step_cache_config={
             "dbcache":DBCacheSettings(
                 adapter=CacheDitAdapterConfig(
