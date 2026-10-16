@@ -438,6 +438,8 @@ class xFuserFlux2Klein9BModel(xFuserModel):
         ulysses_degree=True,
         ring_degree=True,
         use_fp8_gemms=True,
+        use_int8_gemms=True,
+        use_aiter_int8_gemms=True,
         use_fp8_text_encoder=True,
         enable_tiling=True,
         enable_slicing=True,
@@ -467,6 +469,10 @@ class xFuserFlux2Klein9BModel(xFuserModel):
             "transformer.single_transformer_blocks",
         ],
         fp4_gemm_module_list=[
+            "transformer.transformer_blocks",
+            "transformer.single_transformer_blocks",
+        ],
+        int8_gemm_module_list=[
             "transformer.transformer_blocks",
             "transformer.single_transformer_blocks",
         ],
@@ -613,6 +619,10 @@ class xFuserFlux2Klein4BModel(xFuserFlux2Klein9BModel):
         model_output_type="image",
         mod_value=16,
         fp8_gemm_module_list=[
+            "transformer.transformer_blocks",
+            "transformer.single_transformer_blocks",
+        ],
+        int8_gemm_module_list=[
             "transformer.transformer_blocks",
             "transformer.single_transformer_blocks",
         ],
