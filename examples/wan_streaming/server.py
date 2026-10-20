@@ -17,7 +17,7 @@ Stream an image-to-video model with xDiT; everything after ``--`` goes to the
 xDiT runner unchanged, and decides the resolution, frame count and parallelism:
 
     torchrun --nproc_per_node=8 -m examples.wan_streaming.server \\
-        --generator model --seed-image seed.png --prompt "..." -- \\
+        --generator model --prompt "..." -- \\
         --model MiniMax-H3 --task i2va \\
         --height 544 --width 960 --num_frames 124 --num_inference_steps 12 \\
         --attention_backend aiter_bf16 --use_fp8_gemms --ulysses_degree 8 \\
@@ -262,7 +262,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--prompt", default="A drone shot flying slowly over a misty pine forest at sunrise")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--seed-image", help="Image the first clip starts from")
+    parser.add_argument(
+        "--seed-image",
+        help="Image the first clip starts from; the model defaults to assets/seed.png, the fake to a gradient",
+    )
     fake_only = "fake generator only; the model takes it from the xDiT arguments"
     parser.add_argument("--width", type=int, default=960, help=fake_only)
     parser.add_argument("--height", type=int, default=544, help=fake_only)

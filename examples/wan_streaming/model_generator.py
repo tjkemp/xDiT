@@ -7,6 +7,7 @@ import logging
 import threading
 from datetime import timedelta
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -19,6 +20,9 @@ logger = logging.getLogger("wan_streaming")
 
 # Worker ranks wait in a broadcast between clips, for as long as the demo runs.
 _REQUEST_TIMEOUT = timedelta(days=7)
+
+# The last frame of a MiniMax-H3 T2VA clip of the server's default prompt, at 960x544.
+DEFAULT_SEED_IMAGE = Path(__file__).parent / "assets" / "seed.png"
 
 
 def frames_to_uint8(video) -> np.ndarray:
@@ -135,7 +139,8 @@ def run_model_stream(args: argparse.Namespace, xdit_argv: list[str]) -> None:
     from examples.wan_streaming.stream_loop import StreamLoop
 
     if not args.seed_image:
-        raise SystemExit("--seed-image is required with an image-to-video model.")
+        args.seed_image = str(DEFAULT_SEED_IMAGE)
+        logger.info("No --seed-image given; starting from %s", args.seed_image)
 
     runner, base_args, seed_image = _load_runner(args, xdit_argv)
     generator = DistributedClipGenerator(runner, base_args)
