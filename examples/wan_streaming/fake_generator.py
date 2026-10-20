@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import textwrap
 import time
+import zlib
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from examples.wan_streaming.session import GenerationRequest
+from examples.wan_streaming.session import GeneratedClip, GenerationRequest
+
+# Like the model's soundtrack, the fake one runs a little past the last frame.
+_AUDIO_OVERHANG_SECONDS = 0.1
 
 
 class FakeGenerator:
@@ -17,6 +21,10 @@ class FakeGenerator:
     Motion continues across clips and resets on a restart, so a seam or a
     dropped segment is visible in the player. A seed image, when given,
     becomes the scrolling background.
+
+    With a ``sample_rate`` it also makes a soundtrack: a tone pulsing once a
+    second, its pitch set by the prompt. Like the motion, it continues across
+    clips, so a bad seam is audible as a click.
     """
 
     def __init__(
@@ -25,11 +33,15 @@ class FakeGenerator:
         height: int,
         num_frames: int,
         generation_seconds: float,
+        fps: int = 24,
+        sample_rate: int | None = None,
     ) -> None:
         self.width = width
         self.height = height
         self.num_frames = num_frames
         self.generation_seconds = generation_seconds
+        self.fps = fps
+        self.sample_rate = sample_rate
         self._frame_counter = 0
         self._background = self._gradient()
         self._font_large = ImageFont.load_default(size=max(24, height // 14))
@@ -78,12 +90,23 @@ class FakeGenerator:
             )
         return np.asarray(image)
 
-    def generate(self, request: GenerationRequest) -> np.ndarray:
+    def _audio(self, request: GenerationRequest, first_frame: int) -> np.ndarray:
+        """``[2, samples]`` of tone starting at frame ``first_frame`` of the motion."""
+        num_samples = round((self.num_frames / self.fps + _AUDIO_OVERHANG_SECONDS) * self.sample_rate)
+        t = first_frame / self.fps + np.arange(num_samples) / self.sample_rate
+        frequency = 220.0 * 2 ** ((zlib.crc32(request.prompt.encode()) % 24) / 12)
+        pulse = 0.6 + 0.4 * np.cos(2 * np.pi * t)
+        left = np.sin(2 * np.pi * frequency * t)
+        right = np.sin(2 * np.pi * 1.5 * frequency * t)
+        return (0.2 * pulse * np.stack([left, right])).astype(np.float32)
+
+    def generate(self, request: GenerationRequest) -> GeneratedClip:
         started = time.monotonic()
         if request.restarted:
             self._frame_counter = 0
             if request.input_frame is not None:
                 self._background = np.ascontiguousarray(request.input_frame)
+        audio = self._audio(request, self._frame_counter) if self.sample_rate else None
         frames = np.empty((self.num_frames, self.height, self.width, 3), dtype=np.uint8)
         for frame_in_clip in range(self.num_frames):
             frames[frame_in_clip] = self._render(request, frame_in_clip)
@@ -93,4 +116,4 @@ class FakeGenerator:
         remaining = self.generation_seconds - (time.monotonic() - started)
         if remaining > 0:
             time.sleep(remaining)
-        return frames
+        return GeneratedClip(frames, audio, self.sample_rate)

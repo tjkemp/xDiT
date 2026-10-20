@@ -55,13 +55,30 @@ def test_http_segments_are_playable_mp4_in_order(client):
     stream = first.headers["X-Stream-Id"]
     second = _next_segment(client, int(first.headers["X-Segment-Id"]), stream)
 
-    with av.open(io.BytesIO(second.content)) as container:
+    video = second.content[: int(second.headers["X-Video-Size"])]
+    with av.open(io.BytesIO(video)) as container:
         frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
 
     assert first.headers["content-type"] == "video/mp4"
     assert int(second.headers["X-Segment-Id"]) == int(first.headers["X-Segment-Id"]) + 1
     assert frames[0].shape == (HEIGHT, WIDTH, 3)
     assert len(frames) in (NUM_FRAMES, NUM_FRAMES - 1)
+
+
+def test_http_segments_carry_the_soundtrack_after_the_video(client):
+    first = _next_segment(client, -1, "")
+    segment = _next_segment(client, int(first.headers["X-Segment-Id"]), first.headers["X-Stream-Id"])
+
+    video_size, audio_size = int(segment.headers["X-Video-Size"]), int(segment.headers["X-Audio-Size"])
+    audio = segment.content[video_size:]
+    with av.open(io.BytesIO(audio)) as container:
+        samples = sum(frame.samples for frame in container.decode(audio=0))
+
+    assert len(segment.content) == video_size + audio_size
+    assert segment.headers["X-Audio-Codec"] == "mp4a.40.2"
+    assert 0 < int(segment.headers["X-Audio-Init-Size"]) < audio_size
+    assert float(segment.headers["X-Audio-Offset"]) <= 0
+    assert samples == round(float(segment.headers["X-Audio-Duration"]) * 48000)
 
 
 def test_a_prompt_set_over_http_reaches_a_later_segment(client):
@@ -114,7 +131,7 @@ def test_websocket_delivers_metadata_then_the_segment_and_answers_pings(client):
                 seen_pong = True
             elif message["type"] == "segment":
                 data = websocket.receive_bytes()
-                assert len(data) == message["size"]
+                assert len(data) == message["size"] == message["video_size"] + message["audio_size"]
                 assert message["codec"].startswith("avc1.")
                 seen_segment = True
 

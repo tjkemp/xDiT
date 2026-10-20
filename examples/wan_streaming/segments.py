@@ -21,6 +21,16 @@ class Segment:
     generation_seconds: float
     restarted: bool
     created_at: float = field(default_factory=time.time)
+    # A fragmented MP4 sent after the video: its first ``audio_init_size``
+    # bytes are the init segment, the rest one fragment. ``audio_offset`` is
+    # where the fragment starts relative to this segment's first video frame;
+    # it is negative because the encoder and the seam crossfade hold back the
+    # end of each clip's audio until the next clip.
+    audio: bytes = b""
+    audio_codec: str | None = None
+    audio_init_size: int = 0
+    audio_offset: float = 0.0
+    audio_duration: float = 0.0
 
     def metadata(self) -> dict:
         return {
@@ -32,9 +42,19 @@ class Segment:
             "prompt": self.prompt,
             "generation_seconds": self.generation_seconds,
             "restarted": self.restarted,
-            "size": len(self.data),
+            "size": len(self.data) + len(self.audio),
+            "video_size": len(self.data),
+            "audio_size": len(self.audio),
+            "audio_codec": self.audio_codec,
+            "audio_init_size": self.audio_init_size,
+            "audio_offset": self.audio_offset,
+            "audio_duration": self.audio_duration,
             "created_at": self.created_at,
         }
+
+    def payload(self) -> bytes:
+        """The bytes sent to a viewer: the video, then the audio."""
+        return self.data + self.audio
 
 
 class SegmentStore:

@@ -57,8 +57,8 @@ def _worker(rank, world_size, init_method, result_queue):
             for index, prompt in enumerate(_PROMPTS):
                 frame = np.full((4, 6, 3), 10 * (index + 1), dtype=np.uint8)
                 request = GenerationRequest(prompt, 40 + index, index, frame, restarted=index == 0)
-                clip = generator.generate(request)
-                clips.append((clip.dtype.str, clip.shape, int(clip[0, 0, 0, 0])))
+                frames = generator.generate(request).frames
+                clips.append((frames.dtype.str, frames.shape, int(frames[0, 0, 0, 0])))
             generator.shutdown()
             result_queue.put(("returned", rank, runner.calls, clips))
         else:

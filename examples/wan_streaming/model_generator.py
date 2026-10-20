@@ -14,7 +14,7 @@ import torch
 import torch.distributed as dist
 from PIL import Image
 
-from examples.wan_streaming.session import GenerationRequest
+from examples.wan_streaming.session import GeneratedClip, GenerationRequest
 
 logger = logging.getLogger("wan_streaming")
 
@@ -33,6 +33,20 @@ def frames_to_uint8(video) -> np.ndarray:
     if video.dtype == np.uint8:
         return video
     return (np.clip(video, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+
+
+def first_soundtrack(audio) -> np.ndarray | None:
+    """The first item of a pipeline's audio output as float32 ``[channels, samples]``."""
+    if audio is None:
+        return None
+    if isinstance(audio, (list, tuple)):
+        audio = audio[0]
+    if isinstance(audio, torch.Tensor):
+        audio = audio.detach().float().cpu().numpy()
+    audio = np.asarray(audio, dtype=np.float32)
+    while audio.ndim > 2:
+        audio = audio[0]
+    return audio[None] if audio.ndim == 1 else audio
 
 
 class DistributedClipGenerator:
@@ -60,7 +74,7 @@ class DistributedClipGenerator:
         dist.broadcast_object_list(holder, src=self.source_rank, group=self._group)
         return holder[0]
 
-    def generate(self, request: GenerationRequest) -> np.ndarray:
+    def generate(self, request: GenerationRequest) -> GeneratedClip:
         if not self.is_server_rank:
             raise RuntimeError("Only the last rank requests clips; the others run serve_forever().")
         if request.input_frame is None:
@@ -83,7 +97,7 @@ class DistributedClipGenerator:
         if self.is_server_rank:
             self._broadcast(None)
 
-    def _run(self, payload: dict) -> np.ndarray | None:
+    def _run(self, payload: dict) -> GeneratedClip | None:
         # The stream loop calls in from its own thread, whose current device
         # would otherwise default to device 0.
         if self.device is not None:
@@ -99,7 +113,12 @@ class DistributedClipGenerator:
         output, _ = self.runner.model._run_timed_pipe(self.runner.preprocess_args(args))
         if not self.is_server_rank:
             return None
-        return frames_to_uint8(output.videos[0])
+        audio = first_soundtrack(getattr(output, "audio", None))
+        return GeneratedClip(
+            frames=frames_to_uint8(output.videos[0]),
+            audio=audio,
+            sample_rate=int(output.audio_sample_rate) if audio is not None else None,
+        )
 
 
 def _load_runner(args: argparse.Namespace, xdit_argv: list[str]):
@@ -161,6 +180,7 @@ def run_model_stream(args: argparse.Namespace, xdit_argv: list[str]) -> None:
             pacer=PlaybackPacer(margin_seconds=args.lead_margin),
             encode=partial(encode_fragmented_mp4, fps=fps, crf=args.crf, preset=args.preset),
             fps=fps,
+            audio_bit_rate=args.audio_bitrate,
         )
         app = create_app(stream, width=width, height=height, run_stream_loop=False)
         server = uvicorn.Server(

@@ -20,6 +20,14 @@ class GenerationRequest:
     restarted: bool
 
 
+@dataclass(frozen=True)
+class GeneratedClip:
+    frames: np.ndarray  # uint8 [F, H, W, 3]
+    # float32 [channels, samples] in [-1, 1], usually a little longer than the frames.
+    audio: np.ndarray | None = None
+    sample_rate: int | None = None
+
+
 class StreamSession:
     """Viewer-controlled state for the clip chain.
 

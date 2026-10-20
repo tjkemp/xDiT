@@ -24,7 +24,8 @@ xDiT runner unchanged, and decides the resolution, frame count and parallelism:
         --use_parallel_vae --use_torch_compile --warmup_calls 1
 
 Each clip must generate faster than its new frames play, here
-``(124 - 1) / 24 = 5.125`` seconds. The model's audio is not streamed.
+``(124 - 1) / 24 = 5.125`` seconds. The model's soundtrack streams alongside
+the video; the page starts muted, as browsers require for autoplay.
 """
 
 from __future__ import annotations
@@ -69,7 +70,18 @@ def fit_image(image: Image.Image, width: int, height: int) -> np.ndarray:
 
 
 def _segment_headers(segment: Segment) -> dict[str, str]:
+    audio_headers = {}
+    if segment.audio:
+        audio_headers = {
+            "X-Audio-Codec": segment.audio_codec,
+            "X-Audio-Init-Size": str(segment.audio_init_size),
+            "X-Audio-Offset": f"{segment.audio_offset:.6f}",
+            "X-Audio-Duration": f"{segment.audio_duration:.6f}",
+        }
     return {
+        **audio_headers,
+        "X-Video-Size": str(len(segment.data)),
+        "X-Audio-Size": str(len(segment.audio)),
         "X-Stream-Id": segment.stream_id,
         "X-Segment-Id": str(segment.id),
         "X-Created-At": f"{segment.created_at:.3f}",
@@ -175,7 +187,7 @@ def create_app(stream_loop: StreamLoop, width: int, height: int, run_stream_loop
         segment = await store.wait_after(after, min(max(timeout, 0.0), 30.0))
         if segment is None:
             return Response(status_code=204, headers={"Cache-Control": "no-store"})
-        return Response(content=segment.data, media_type="video/mp4", headers=_segment_headers(segment))
+        return Response(content=segment.payload(), media_type="video/mp4", headers=_segment_headers(segment))
 
     @app.websocket("/api/ws")
     async def stream_websocket(websocket: WebSocket) -> None:
@@ -194,7 +206,7 @@ def create_app(stream_loop: StreamLoop, width: int, height: int, run_stream_loop
                         await websocket.send_json({"type": "status", **status()})
                         continue
                     await websocket.send_json({"type": "segment", **segment.metadata()})
-                    await websocket.send_bytes(segment.data)
+                    await websocket.send_bytes(segment.payload())
                 last_id = segment.id
 
         sender = asyncio.create_task(send_segments())
@@ -239,6 +251,8 @@ def build_fake_stream(args: argparse.Namespace) -> StreamLoop:
         height=args.height,
         num_frames=args.num_frames,
         generation_seconds=args.fake_generation_seconds,
+        fps=args.fps,
+        sample_rate=args.fake_sample_rate or None,
     )
     return StreamLoop(
         generator=generator,
@@ -247,6 +261,7 @@ def build_fake_stream(args: argparse.Namespace) -> StreamLoop:
         pacer=PlaybackPacer(margin_seconds=args.lead_margin),
         encode=partial(encode_fragmented_mp4, fps=args.fps, crf=args.crf, preset=args.preset),
         fps=args.fps,
+        audio_bit_rate=args.audio_bitrate,
     )
 
 
@@ -279,6 +294,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=3.0,
         help="How long the fake generator takes per clip; above the clip length it simulates a too-slow model",
     )
+    parser.add_argument(
+        "--fake-sample-rate",
+        type=int,
+        default=48000,
+        help="Sample rate of the fake generator's test tone; 0 makes a silent, video-only stream",
+    )
+    parser.add_argument("--audio-bitrate", type=int, default=128_000, help="AAC bit rate for the soundtrack")
     parser.add_argument(
         "--lead-margin",
         type=float,

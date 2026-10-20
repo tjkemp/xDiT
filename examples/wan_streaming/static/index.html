@@ -35,6 +35,7 @@
     <input id="prompt" autocomplete="off" placeholder="Describe how the video should continue...">
     <button type="submit">Apply</button>
     <button type="button" class="secondary" id="restart">Restart</button>
+    <button type="button" class="secondary" id="sound" style="display: none">Unmute</button>
     <label class="button" for="seed-file">Seed image...</label>
     <input type="file" id="seed-file" accept="image/*">
   </form>
@@ -58,7 +59,8 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const video = document.getElementById("video");
 const diag = {
-  transport: "connecting", connection: "-", codec: "-", received: 0, skipped: 0, duplicates: 0,
+  transport: "connecting", connection: "-", codec: "-", audio: "-", audioRanges: "-",
+  received: 0, skipped: 0, duplicates: 0,
   lastSizeKB: "-", transferMbps: "-", rttMs: "-", bufferAhead: "-", liveLag: "-",
   stalls: 0, stallSeconds: 0, serverGeneration: "-", serverEncode: "-", serverBuffered: "-",
   viewers: "-", lastError: "-",
@@ -75,14 +77,43 @@ function renderDiag() {
   document.getElementById("diag").innerHTML = rows.join("");
 }
 
+function appendTo(buffer, data) {
+  return new Promise((resolve, reject) => {
+    const settle = (error) => {
+      buffer.removeEventListener("updateend", onEnd);
+      buffer.removeEventListener("error", onError);
+      if (error) reject(error); else resolve();
+    };
+    const onEnd = () => settle(null);
+    const onError = () => settle(new Error("SourceBuffer error"));
+    buffer.addEventListener("updateend", onEnd);
+    buffer.addEventListener("error", onError);
+    try {
+      buffer.appendBuffer(data);
+    } catch (error) {
+      settle(error);
+    }
+  });
+}
+
+function removeFrom(buffer, end) {
+  return new Promise((resolve) => {
+    buffer.addEventListener("updateend", resolve, { once: true });
+    buffer.remove(0, end);
+  });
+}
+
 class Player {
   constructor(element) {
     this.video = element;
     this.mediaSource = new MediaSource();
     this.video.src = URL.createObjectURL(this.mediaSource);
-    this.sourceBuffer = null;
+    this.videoBuffer = null;
+    this.audioBuffer = null;
     this.codec = null;
+    this.audioInitStream = null;  // stream whose audio init segment the audio buffer has
     this.queue = [];
+    this.appending = false;
     this.timeline = [];  // {start, end, meta} for each appended segment
     this.opened = new Promise((resolve) => this.mediaSource.addEventListener("sourceopen", resolve, { once: true }));
     this.stallStart = null;
@@ -100,72 +131,96 @@ class Player {
     setInterval(() => this.watch(), 500);
   }
 
-  mimeType(codec) { return `video/mp4; codecs="${codec}"`; }
-
   async push(meta, data) {
     await this.opened;
     this.queue.push({ meta, data });
-    this.pump();
+    if (this.appending) return;
+    this.appending = true;
+    try {
+      while (this.queue.length) {
+        const segment = this.queue.shift();
+        try {
+          await this.append(segment.meta, segment.data);
+        } catch (error) {
+          diag.lastError = `append: ${error.name || error.message}`;
+          if (error.name === "QuotaExceededError") await this.trim(true);
+        }
+        await this.trim(false);
+      }
+    } finally {
+      this.appending = false;
+    }
   }
 
   bufferedEnd() {
-    const ranges = this.sourceBuffer ? this.sourceBuffer.buffered : null;
+    const ranges = this.videoBuffer ? this.videoBuffer.buffered : null;
     return ranges && ranges.length ? ranges.end(ranges.length - 1) : 0;
   }
 
-  pump() {
-    if (!this.queue.length || (this.sourceBuffer && this.sourceBuffer.updating)) return;
-    const { meta, data } = this.queue[0];
-    const type = this.mimeType(meta.codec);
-    if (!MediaSource.isTypeSupported(type)) {
-      showError(`This browser cannot play ${type}. Use a recent Chrome or Firefox.`);
-      this.queue.shift();
+  createBuffers(meta) {
+    // Every SourceBuffer has to exist before the first append, so whether the
+    // stream has audio is decided by its first segment.
+    this.videoBuffer = this.mediaSource.addSourceBuffer(`video/mp4; codecs="${meta.codec}"`);
+    // Self-contained segments that each start at zero play back to back.
+    this.videoBuffer.mode = "sequence";
+    this.codec = meta.codec;
+    if (!meta.audio_size) {
+      diag.audio = "none";
       return;
     }
-    if (!this.sourceBuffer) {
-      this.sourceBuffer = this.mediaSource.addSourceBuffer(type);
-      this.sourceBuffer.mode = "sequence";
-      this.sourceBuffer.addEventListener("updateend", () => this.afterUpdate());
-      this.sourceBuffer.addEventListener("error", () => { diag.lastError = "SourceBuffer error"; });
-      this.codec = meta.codec;
-    } else if (meta.codec !== this.codec && this.sourceBuffer.changeType) {
-      this.sourceBuffer.changeType(type);
+    const audioType = `audio/mp4; codecs="${meta.audio_codec}"`;
+    if (!MediaSource.isTypeSupported(audioType)) {
+      diag.audio = `unsupported (${meta.audio_codec})`;
+      return;
+    }
+    // Audio fragments carry no timeline of their own; each is placed against
+    // the video segment it belongs to.
+    this.audioBuffer = this.mediaSource.addSourceBuffer(audioType);
+    diag.audio = meta.audio_codec;
+    document.getElementById("sound").style.display = "";
+  }
+
+  async append(meta, data) {
+    const type = `video/mp4; codecs="${meta.codec}"`;
+    if (!MediaSource.isTypeSupported(type)) {
+      showError(`This browser cannot play ${type}. Use a recent Chrome or Firefox.`);
+      return;
+    }
+    if (!this.videoBuffer) {
+      this.createBuffers(meta);
+    } else if (meta.codec !== this.codec && this.videoBuffer.changeType) {
+      this.videoBuffer.changeType(type);
       this.codec = meta.codec;
     }
     diag.codec = this.codec;
-    this.pending = { meta, start: this.bufferedEnd() };
-    try {
-      this.sourceBuffer.appendBuffer(data);
-    } catch (error) {
-      diag.lastError = `append: ${error.name}`;
-      this.queue.shift();
-      this.pending = null;
-      if (error.name === "QuotaExceededError") this.trim(true);
+
+    const start = this.bufferedEnd();
+    await appendTo(this.videoBuffer, data.slice(0, meta.video_size));
+    if (this.audioBuffer && meta.audio_size) {
+      const audio = data.slice(meta.video_size, meta.video_size + meta.audio_size);
+      if (this.audioInitStream !== meta.stream_id) {
+        await appendTo(this.audioBuffer, audio.slice(0, meta.audio_init_size));
+        this.audioInitStream = meta.stream_id;
+      }
+      this.audioBuffer.timestampOffset = start + meta.audio_offset;
+      await appendTo(this.audioBuffer, audio.slice(meta.audio_init_size));
     }
+
+    this.timeline.push({ start, end: this.bufferedEnd(), meta });
+    if (this.timeline.length === 1) this.video.currentTime = start;
+    this.keepLive();
+    this.play();
   }
 
-  afterUpdate() {
-    if (this.pending) {
-      const { meta, start } = this.pending;
-      this.pending = null;
-      this.queue.shift();
-      this.timeline.push({ start, end: this.bufferedEnd(), meta });
-      if (this.timeline.length === 1) this.video.currentTime = start;
-      this.keepLive();
-      this.play();
-    }
-    if (!this.trim(false)) this.pump();
-  }
-
-  trim(force) {
+  async trim(force) {
     const behind = this.video.currentTime - 15;
-    const ranges = this.sourceBuffer.buffered;
-    if (!ranges.length || this.sourceBuffer.updating) return false;
-    if (!force && ranges.start(0) > behind - 15) return false;
-    if (behind <= ranges.start(0)) return false;
+    for (const buffer of [this.videoBuffer, this.audioBuffer]) {
+      if (!buffer || !buffer.buffered.length) continue;
+      const oldest = buffer.buffered.start(0);
+      if (behind <= oldest || (!force && oldest > behind - 15)) continue;
+      await removeFrom(buffer, behind);
+    }
     this.timeline = this.timeline.filter((entry) => entry.end > behind);
-    this.sourceBuffer.remove(0, behind);
-    return true;
   }
 
   keepLive() {
@@ -184,8 +239,9 @@ class Player {
   }
 
   watch() {
-    if (!this.sourceBuffer) return;
-    const ranges = this.sourceBuffer.buffered;
+    if (!this.videoBuffer) return;
+    // Where both video and audio are buffered.
+    const ranges = this.video.buffered;
     const now = this.video.currentTime;
     // Skip over any hole in the buffer instead of stalling at it.
     for (let i = 0; i < ranges.length; i++) {
@@ -194,7 +250,11 @@ class Player {
         break;
       }
     }
-    diag.bufferAhead = Math.max(0, this.bufferedEnd() - now).toFixed(1) + " s";
+    const playableEnd = ranges.length ? ranges.end(ranges.length - 1) : 0;
+    diag.bufferAhead = Math.max(0, playableEnd - now).toFixed(1) + " s";
+    if (this.audioBuffer && this.audioBuffer.buffered.length) {
+      diag.audioRanges = this.audioBuffer.buffered.length;
+    }
     const playing = this.timeline.find((entry) => now >= entry.start && now < entry.end);
     if (playing) {
       document.getElementById("playing-prompt").textContent =
@@ -207,6 +267,13 @@ class Player {
 
 const player = new Player(video);
 document.getElementById("banner").addEventListener("click", () => player.play());
+
+// Browsers only autoplay muted video; unmuting needs a click.
+document.getElementById("sound").addEventListener("click", (event) => {
+  video.muted = !video.muted;
+  event.target.textContent = video.muted ? "Unmute" : "Mute";
+  player.play();
+});
 
 let lastSegment = { stream: null, id: -1 };
 
@@ -237,6 +304,12 @@ function metaFromHeaders(headers) {
     restarted: headers.get("X-Restarted") === "1",
     prompt: decodeURIComponent(headers.get("X-Prompt") || ""),
     created_at: Number(headers.get("X-Created-At")),
+    video_size: Number(headers.get("X-Video-Size")),
+    audio_size: Number(headers.get("X-Audio-Size") || 0),
+    audio_codec: headers.get("X-Audio-Codec"),
+    audio_init_size: Number(headers.get("X-Audio-Init-Size") || 0),
+    audio_offset: Number(headers.get("X-Audio-Offset") || 0),
+    audio_duration: Number(headers.get("X-Audio-Duration") || 0),
   };
 }
 
