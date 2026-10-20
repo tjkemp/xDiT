@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xDiT live video</title>
+<style>
+  :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+  body { margin: 0; background: #111; color: #eee; }
+  main { max-width: 1320px; margin: 0 auto; padding: 16px; display: grid; gap: 12px; }
+  video { width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 6px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  #prompt { flex: 1; min-width: 280px; padding: 10px; font-size: 16px; background: #222; color: #eee;
+            border: 1px solid #444; border-radius: 4px; }
+  button, label.button { padding: 10px 14px; font-size: 15px; background: #2d5be3; color: #fff; border: 0;
+                         border-radius: 4px; cursor: pointer; }
+  button.secondary, label.button { background: #444; }
+  #seed-file { display: none; }
+  .now { font-size: 15px; line-height: 1.5; }
+  .now b { color: #9cf; }
+  #banner { display: none; padding: 10px; background: #7a2; color: #fff; border-radius: 4px; cursor: pointer; }
+  #error { display: none; padding: 10px; background: #a33; border-radius: 4px; }
+  details { background: #1b1b1b; border-radius: 6px; padding: 8px 12px; }
+  #diag { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 2px 16px;
+          font: 13px ui-monospace, monospace; margin-top: 8px; }
+  #diag div span { color: #9cf; }
+</style>
+</head>
+<body>
+<main>
+  <div id="error"></div>
+  <div id="banner">Playback is paused by the browser. Click here to start.</div>
+  <video id="video" muted autoplay playsinline></video>
+  <form id="prompt-form" class="row">
+    <input id="prompt" autocomplete="off" placeholder="Describe how the video should continue...">
+    <button type="submit">Apply</button>
+    <button type="button" class="secondary" id="restart">Restart</button>
+    <label class="button" for="seed-file">Seed image...</label>
+    <input type="file" id="seed-file" accept="image/*">
+  </form>
+  <div class="now">
+    <div>Playing: <b id="playing-prompt">-</b></div>
+    <div>Next clips use: <b id="next-prompt">-</b></div>
+  </div>
+  <details open>
+    <summary>Diagnostics</summary>
+    <div id="diag"></div>
+  </details>
+</main>
+<script>
+"use strict";
+
+const params = new URLSearchParams(location.search);
+const requestedTransport = params.get("transport") || "auto";  // auto | ws | http
+const viewerId = Math.random().toString(36).slice(2);
+const apiUrl = (path) => new URL(path, location.href);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const video = document.getElementById("video");
+const diag = {
+  transport: "connecting", connection: "-", codec: "-", received: 0, skipped: 0, duplicates: 0,
+  lastSizeKB: "-", transferMbps: "-", rttMs: "-", bufferAhead: "-", liveLag: "-",
+  stalls: 0, stallSeconds: 0, serverGeneration: "-", serverEncode: "-", serverBuffered: "-",
+  viewers: "-", lastError: "-",
+};
+
+function showError(message) {
+  const box = document.getElementById("error");
+  box.textContent = message;
+  box.style.display = message ? "block" : "none";
+}
+
+function renderDiag() {
+  const rows = Object.entries(diag).map(([key, value]) => `<div>${key}: <span>${value}</span></div>`);
+  document.getElementById("diag").innerHTML = rows.join("");
+}
+
+class Player {
+  constructor(element) {
+    this.video = element;
+    this.mediaSource = new MediaSource();
+    this.video.src = URL.createObjectURL(this.mediaSource);
+    this.sourceBuffer = null;
+    this.codec = null;
+    this.queue = [];
+    this.timeline = [];  // {start, end, meta} for each appended segment
+    this.opened = new Promise((resolve) => this.mediaSource.addEventListener("sourceopen", resolve, { once: true }));
+    this.stallStart = null;
+    this.video.addEventListener("waiting", () => {
+      if (this.timeline.length && this.stallStart === null) this.stallStart = performance.now();
+    });
+    this.video.addEventListener("playing", () => {
+      if (this.stallStart === null) return;
+      const seconds = (performance.now() - this.stallStart) / 1000;
+      this.stallStart = null;
+      if (seconds < 0.2) return;
+      diag.stalls += 1;
+      diag.stallSeconds = +(diag.stallSeconds + seconds).toFixed(1);
+    });
+    setInterval(() => this.watch(), 500);
+  }
+
+  mimeType(codec) { return `video/mp4; codecs="${codec}"`; }
+
+  async push(meta, data) {
+    await this.opened;
+    this.queue.push({ meta, data });
+    this.pump();
+  }
+
+  bufferedEnd() {
+    const ranges = this.sourceBuffer ? this.sourceBuffer.buffered : null;
+    return ranges && ranges.length ? ranges.end(ranges.length - 1) : 0;
+  }
+
+  pump() {
+    if (!this.queue.length || (this.sourceBuffer && this.sourceBuffer.updating)) return;
+    const { meta, data } = this.queue[0];
+    const type = this.mimeType(meta.codec);
+    if (!MediaSource.isTypeSupported(type)) {
+      showError(`This browser cannot play ${type}. Use a recent Chrome or Firefox.`);
+      this.queue.shift();
+      return;
+    }
+    if (!this.sourceBuffer) {
+      this.sourceBuffer = this.mediaSource.addSourceBuffer(type);
+      this.sourceBuffer.mode = "sequence";
+      this.sourceBuffer.addEventListener("updateend", () => this.afterUpdate());
+      this.sourceBuffer.addEventListener("error", () => { diag.lastError = "SourceBuffer error"; });
+      this.codec = meta.codec;
+    } else if (meta.codec !== this.codec && this.sourceBuffer.changeType) {
+      this.sourceBuffer.changeType(type);
+      this.codec = meta.codec;
+    }
+    diag.codec = this.codec;
+    this.pending = { meta, start: this.bufferedEnd() };
+    try {
+      this.sourceBuffer.appendBuffer(data);
+    } catch (error) {
+      diag.lastError = `append: ${error.name}`;
+      this.queue.shift();
+      this.pending = null;
+      if (error.name === "QuotaExceededError") this.trim(true);
+    }
+  }
+
+  afterUpdate() {
+    if (this.pending) {
+      const { meta, start } = this.pending;
+      this.pending = null;
+      this.queue.shift();
+      this.timeline.push({ start, end: this.bufferedEnd(), meta });
+      if (this.timeline.length === 1) this.video.currentTime = start;
+      this.keepLive();
+      this.play();
+    }
+    if (!this.trim(false)) this.pump();
+  }
+
+  trim(force) {
+    const behind = this.video.currentTime - 15;
+    const ranges = this.sourceBuffer.buffered;
+    if (!ranges.length || this.sourceBuffer.updating) return false;
+    if (!force && ranges.start(0) > behind - 15) return false;
+    if (behind <= ranges.start(0)) return false;
+    this.timeline = this.timeline.filter((entry) => entry.end > behind);
+    this.sourceBuffer.remove(0, behind);
+    return true;
+  }
+
+  keepLive() {
+    // A viewer that fell behind (for example a backgrounded tab) jumps to the newest clip.
+    const newest = this.timeline[this.timeline.length - 1];
+    const maxLag = 2.5 * (newest.end - newest.start);
+    if (this.bufferedEnd() - this.video.currentTime > maxLag) this.video.currentTime = newest.start;
+  }
+
+  play() {
+    if (!this.video.paused) return;
+    this.video.play().then(
+      () => { document.getElementById("banner").style.display = "none"; },
+      () => { document.getElementById("banner").style.display = "block"; },
+    );
+  }
+
+  watch() {
+    if (!this.sourceBuffer) return;
+    const ranges = this.sourceBuffer.buffered;
+    const now = this.video.currentTime;
+    // Skip over any hole in the buffer instead of stalling at it.
+    for (let i = 0; i < ranges.length; i++) {
+      if (now < ranges.start(i) && (i === 0 || now >= ranges.end(i - 1) - 0.05)) {
+        this.video.currentTime = ranges.start(i);
+        break;
+      }
+    }
+    diag.bufferAhead = Math.max(0, this.bufferedEnd() - now).toFixed(1) + " s";
+    const playing = this.timeline.find((entry) => now >= entry.start && now < entry.end);
+    if (playing) {
+      document.getElementById("playing-prompt").textContent =
+        `clip ${playing.meta.clip_index}: ${playing.meta.prompt}`;
+      diag.liveLag = ((Date.now() / 1000) - playing.meta.created_at - (now - playing.start)).toFixed(1) + " s";
+    }
+    renderDiag();
+  }
+}
+
+const player = new Player(video);
+document.getElementById("banner").addEventListener("click", () => player.play());
+
+let lastSegment = { stream: null, id: -1 };
+
+function onSegment(meta, data, transferMs) {
+  if (meta.stream_id !== lastSegment.stream) {
+    lastSegment = { stream: meta.stream_id, id: -1 };
+  }
+  if (meta.id <= lastSegment.id) {
+    diag.duplicates += 1;
+    return;
+  }
+  if (lastSegment.id >= 0 && meta.id > lastSegment.id + 1) diag.skipped += meta.id - lastSegment.id - 1;
+  lastSegment.id = meta.id;
+  diag.received += 1;
+  diag.lastSizeKB = (data.byteLength / 1024).toFixed(0);
+  if (transferMs > 0) diag.transferMbps = ((data.byteLength * 8) / (transferMs * 1000)).toFixed(1);
+  player.push(meta, data);
+}
+
+function metaFromHeaders(headers) {
+  return {
+    stream_id: headers.get("X-Stream-Id"),
+    id: Number(headers.get("X-Segment-Id")),
+    codec: headers.get("X-Codec"),
+    duration: Number(headers.get("X-Duration")),
+    clip_index: Number(headers.get("X-Clip-Index")),
+    generation_seconds: Number(headers.get("X-Generation-Seconds")),
+    restarted: headers.get("X-Restarted") === "1",
+    prompt: decodeURIComponent(headers.get("X-Prompt") || ""),
+    created_at: Number(headers.get("X-Created-At")),
+  };
+}
+
+let transport = requestedTransport === "http" ? "http" : "ws";
+let socket = null;
+
+async function httpLoop() {
+  diag.transport = "http";
+  diag.connection = "polling";
+  while (transport === "http") {
+    try {
+      const query = `after=${lastSegment.id}&stream=${lastSegment.stream || ""}&timeout=20&viewer=${viewerId}`;
+      const response = await fetch(apiUrl(`api/segment?${query}`), { cache: "no-store" });
+      if (response.status === 204) continue;
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const headersAt = performance.now();
+      const data = await response.arrayBuffer();
+      diag.connection = "polling";
+      onSegment(metaFromHeaders(response.headers), data, performance.now() - headersAt);
+    } catch (error) {
+      diag.connection = "retrying";
+      diag.lastError = `http: ${error.message}`;
+      await sleep(1000);
+    }
+  }
+}
+
+function connectWebSocket() {
+  diag.transport = "ws";
+  diag.connection = "connecting";
+  const url = apiUrl("api/ws");
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  let received = false;
+  let pendingMeta = null;
+  let metaAt = 0;
+  socket = new WebSocket(url);
+  socket.binaryType = "arraybuffer";
+  const openTimeout = setTimeout(() => socket.close(), 5000);
+
+  socket.onopen = () => {
+    clearTimeout(openTimeout);
+    diag.connection = "open";
+  };
+  socket.onmessage = (event) => {
+    if (typeof event.data !== "string") {
+      if (pendingMeta) onSegment(pendingMeta, event.data, performance.now() - metaAt);
+      pendingMeta = null;
+      received = true;
+      return;
+    }
+    const message = JSON.parse(event.data);
+    if (message.type === "segment") {
+      pendingMeta = message;
+      metaAt = performance.now();
+    } else if (message.type === "pong") {
+      diag.rttMs = (performance.now() - message.t).toFixed(0);
+    } else if (message.type === "status") {
+      updateStatus(message);
+    } else if (message.type === "error") {
+      diag.lastError = message.detail;
+    }
+  };
+  socket.onclose = () => {
+    clearTimeout(openTimeout);
+    socket = null;
+    if (!received && requestedTransport === "auto") {
+      diag.lastError = "WebSocket failed; falling back to HTTP";
+      transport = "http";
+      httpLoop();
+      return;
+    }
+    diag.connection = "reconnecting";
+    setTimeout(connectWebSocket, 1000);
+  };
+}
+
+function updateStatus(status) {
+  document.getElementById("next-prompt").textContent = status.prompt;
+  const seconds = (value) => (value == null ? "-" : value.toFixed(2) + " s");
+  diag.serverGeneration = seconds(status.last_generation_seconds);
+  diag.serverEncode = seconds(status.last_encode_seconds);
+  diag.serverBuffered = seconds(status.buffered_seconds);
+  diag.viewers = `${status.viewers.websocket} ws / ${status.viewers.http} http`;
+  if (status.last_error) diag.lastError = `server: ${status.last_error}`;
+}
+
+async function pollStatus() {
+  while (true) {
+    try {
+      const started = performance.now();
+      const response = await fetch(apiUrl("api/status"), { cache: "no-store" });
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        diag.rttMs = (performance.now() - started).toFixed(0);
+      }
+      updateStatus(await response.json());
+    } catch (error) {
+      diag.lastError = `status: ${error.message}`;
+    }
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "ping", t: performance.now() }));
+    }
+    await sleep(2000);
+  }
+}
+
+async function post(path, body, headers) {
+  const response = await fetch(apiUrl(path), { method: "POST", body, headers });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}));
+    throw new Error(detail.detail || `HTTP ${response.status}`);
+  }
+  updateStatus(await response.json());
+}
+
+document.getElementById("prompt-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = document.getElementById("prompt");
+  try {
+    await post("api/prompt", JSON.stringify({ prompt: input.value }), { "Content-Type": "application/json" });
+    input.value = "";
+    showError("");
+  } catch (error) {
+    showError(`Could not set prompt: ${error.message}`);
+  }
+});
+
+document.getElementById("restart").addEventListener("click", () =>
+  post("api/restart").catch((error) => showError(`Restart failed: ${error.message}`)));
+
+document.getElementById("seed-file").addEventListener("change", async (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+  try {
+    await post("api/seed_image", file, { "Content-Type": file.type || "application/octet-stream" });
+    showError("");
+  } catch (error) {
+    showError(`Seed image upload failed: ${error.message}`);
+  }
+  event.target.value = "";
+});
+
+if (!window.MediaSource) {
+  showError("This browser has no Media Source Extensions. Use a recent Chrome or Firefox.");
+} else {
+  if (transport === "http") httpLoop(); else connectWebSocket();
+  pollStatus();
+}
+renderDiag();
+</script>
+</body>
+</html>
