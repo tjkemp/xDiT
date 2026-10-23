@@ -23,6 +23,9 @@ from xfuser.core.distributed import (
 from xfuser.core.attention import registry as attention_registry
 from xfuser.core.attention.spec import Sparsity
 from xfuser.core.attention.backends.vsa_h3.attention import build_h3_vsa_metadata
+from xfuser.model_executor.layers.fused_qkv_norm_rope_minimax_h3_triton import (
+    minimax_h3_qkv_norm_rope,
+)
 from xfuser.model_executor.layers.usp import (
     ULYSSES_EXTRA_INPUTS_KEY,
     USP,
@@ -64,23 +67,32 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
                 "the varlen metadata prepared by the transformer wrapper."
             )
 
-        if attn.fused_projections:
-            query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
+        if attn.fused_projections and rotary_emb is not None:
+            query, key, value = minimax_h3_qkv_norm_rope(
+                attn.to_qkv(hidden_states),
+                attn.norm_q,
+                attn.norm_k,
+                *rotary_emb,
+                attn.heads,
+            )
         else:
-            query = attn.to_q(hidden_states)
-            key = attn.to_k(hidden_states)
-            value = attn.to_v(hidden_states)
+            if attn.fused_projections:
+                query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
+            else:
+                query = attn.to_q(hidden_states)
+                key = attn.to_k(hidden_states)
+                value = attn.to_v(hidden_states)
 
-        query = query.unflatten(-1, (attn.heads, -1))
-        key = key.unflatten(-1, (attn.heads, -1))
-        value = value.unflatten(-1, (attn.heads, -1))
+            query = query.unflatten(-1, (attn.heads, -1))
+            key = key.unflatten(-1, (attn.heads, -1))
+            value = value.unflatten(-1, (attn.heads, -1))
 
-        query = attn.norm_q(query)
-        key = attn.norm_k(key)
+            query = attn.norm_q(query)
+            key = attn.norm_k(key)
 
-        if rotary_emb is not None:
-            query = _apply_rotary_emb(query, *rotary_emb)
-            key = _apply_rotary_emb(key, *rotary_emb)
+            if rotary_emb is not None:
+                query = _apply_rotary_emb(query, *rotary_emb)
+                key = _apply_rotary_emb(key, *rotary_emb)
 
         use_vsa_h3 = self.use_vsa_h3
         if use_vsa_h3:
