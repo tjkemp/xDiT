@@ -13,13 +13,12 @@ load of the same cache lines rather than a second pass over memory.
 
 Numerics
 --------
-The kernel replays the rounding schedule of the compiled reference.
-``torch.nn.RMSNorm`` normalises and applies its weight in fp32 and rounds once;
-``_apply_rotary_emb`` rounds cos/sin to the activation dtype, then rotates in
-fp32 and rounds once at the store. Channels from ``rotary_dim`` up pass through
-the norm unrotated. Eager PyTorch also rounds after each rotate multiply, so
-against eager the rotated channels agree to within a bf16 ULP rather than
-bitwise.
+The norm and the rotation are computed in fp32, with fp32 cos/sin, and q/k are
+rounded once at the store; channels from ``rotary_dim`` up pass through the
+norm unrotated and v is copied bit for bit. Inductor also keeps bf16
+intermediates in fp32 inside a fused kernel, but rounds every intermediate it
+stores between kernels, and eager PyTorch rounds after every op, so against
+either one q/k differ by a few bf16 ULPs rather than bitwise.
 
 Envelope / fallback
 -------------------
@@ -67,8 +66,8 @@ if _HAS_TRITON:
         rstd = tl.rsqrt(tl.sum(x * x, axis=1) / D + eps)[:, None]
         weight = tl.load(w_ptr + cols).to(tl.float32)[None, :]
         weight_partner = tl.load(w_ptr + partner).to(tl.float32)[None, :]
-        y = (x * rstd * weight).to(tl.bfloat16).to(tl.float32)
-        y_partner = (x_partner * rstd * weight_partner).to(tl.bfloat16).to(tl.float32)
+        y = x * rstd * weight
+        y_partner = x_partner * rstd * weight_partner
         return tl.where(rotated[None, :], y * cos + sign[None, :] * y_partner * sin, y)
 
     @triton.autotune(
@@ -116,8 +115,8 @@ if _HAS_TRITON:
 
         freq = ((token % seq_len).to(tl.int64) * freq_row_stride)[:, None] + cols[None, :]
         freq_mask = mask & rotated[None, :]
-        cos = tl.load(cos_ptr + freq, mask=freq_mask, other=0.0).to(tl.bfloat16).to(tl.float32)
-        sin = tl.load(sin_ptr + freq, mask=freq_mask, other=0.0).to(tl.bfloat16).to(tl.float32)
+        cos = tl.load(cos_ptr + freq, mask=freq_mask, other=0.0).to(tl.float32)
+        sin = tl.load(sin_ptr + freq, mask=freq_mask, other=0.0).to(tl.float32)
 
         query = _norm_rope(
             src + cols[None, :],
