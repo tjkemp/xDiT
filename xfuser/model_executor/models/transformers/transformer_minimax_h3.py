@@ -9,6 +9,7 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
     MINIMAX_H3_MODALITY_NUM,
     MiniMaxH3AttnProcessor,
     MiniMaxH3Transformer3DModel,
+    MiniMaxH3TransformerBlock,
     MiniMaxH3TransformerOutput,
     _apply_rotary_emb,
 )
@@ -25,6 +26,9 @@ from xfuser.core.attention.spec import Sparsity
 from xfuser.core.attention.backends.vsa_h3.attention import build_h3_vsa_metadata
 from xfuser.model_executor.layers.fused_qkv_norm_rope_minimax_h3_triton import (
     minimax_h3_qkv_norm_rope,
+)
+from xfuser.model_executor.layers.fused_residual_norm_modulate_minimax_h3_triton import (
+    minimax_h3_residual_norm_modulate,
 )
 from xfuser.model_executor.layers.usp import (
     ULYSSES_EXTRA_INPUTS_KEY,
@@ -137,6 +141,91 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
         return hidden_states
 
 
+class xFuserMiniMaxH3TransformerBlock(MiniMaxH3TransformerBlock):
+    """MiniMax-H3 block that can leave its feed-forward residual to the next block.
+
+    With ``defer_residual`` the block returns ``(hidden_states, ff_output,
+    gate_mlp)`` without adding the gated feed-forward output, and folds the
+    ``pending_residual`` it receives, ``(ff_output, gate_mlp)`` of the block
+    before, into its ``norm1``. Each residual add then shares a single pass
+    over the row with the RMSNorm and modulation that read it. Without
+    ``defer_residual`` this is the upstream block.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        adaln_indices: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        pending_residual: tuple[torch.Tensor, torch.Tensor] | None = None,
+        defer_residual: bool = False,
+    ):
+        if not defer_residual:
+            if pending_residual is not None:
+                raise ValueError("pending_residual requires defer_residual=True.")
+            return super().forward(
+                hidden_states, temb, adaln_indices, rotary_emb, attention_mask
+            )
+
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaln_proj(temb)
+        )
+        branch, gate = pending_residual or (None, None)
+        hidden_states, norm_hidden_states = minimax_h3_residual_norm_modulate(
+            hidden_states,
+            branch,
+            gate,
+            adaln_indices,
+            shift_msa,
+            scale_msa,
+            adaln_indices,
+            self.norm1,
+        )
+        attn_output = self.attn(norm_hidden_states, rotary_emb, attention_mask)
+        hidden_states, norm_hidden_states = minimax_h3_residual_norm_modulate(
+            hidden_states,
+            attn_output,
+            gate_msa,
+            adaln_indices,
+            shift_mlp,
+            scale_mlp,
+            adaln_indices,
+            self.norm2,
+        )
+        return hidden_states, self.ff(norm_hidden_states), gate_mlp
+
+
+def run_blocks_deferring_residual(
+    blocks,
+    hidden_states: torch.Tensor,
+    temb: torch.Tensor,
+    adaln_indices: torch.Tensor,
+    rotary_emb: tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """Run ``xFuserMiniMaxH3TransformerBlock``s with each feed-forward residual deferred.
+
+    Equivalent to calling the blocks in turn. Blocks are called as modules so
+    their hooks, FSDP's among them, still fire.
+    """
+    pending_residual = None
+    for block in blocks:
+        hidden_states, ff_output, gate_mlp = block(
+            hidden_states,
+            temb,
+            adaln_indices,
+            rotary_emb,
+            None,
+            pending_residual=pending_residual,
+            defer_residual=True,
+        )
+        pending_residual = (ff_output, gate_mlp)
+    if pending_residual is None:
+        return hidden_states
+    return hidden_states + gate_mlp.index_select(0, adaln_indices) * ff_output
+
+
 class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
     def __init__(
         self,
@@ -234,6 +323,7 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
             )
 
         for block in self.transformer_blocks:
+            block.__class__ = xFuserMiniMaxH3TransformerBlock
             block.attn.set_processor(
                 xFuserMiniMaxH3AttnProcessor(
                     use_ulysses_parallel_attention=True,
@@ -519,24 +609,34 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
             }
         )
 
-        for block in self.transformer_blocks:
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                packed_hidden_states = self._gradient_checkpointing_func(
-                    block,
-                    packed_hidden_states,
-                    temb,
-                    adaln_indices,
-                    rotary_emb,
-                    None,
-                )
-            else:
-                packed_hidden_states = block(
-                    packed_hidden_states,
-                    temb,
-                    adaln_indices,
-                    rotary_emb,
-                    None,
-                )
+        if not torch.is_grad_enabled():
+            # The fused residual kernels have no autograd formula.
+            packed_hidden_states = run_blocks_deferring_residual(
+                self.transformer_blocks,
+                packed_hidden_states,
+                temb,
+                adaln_indices,
+                rotary_emb,
+            )
+        else:
+            for block in self.transformer_blocks:
+                if self.gradient_checkpointing:
+                    packed_hidden_states = self._gradient_checkpointing_func(
+                        block,
+                        packed_hidden_states,
+                        temb,
+                        adaln_indices,
+                        rotary_emb,
+                        None,
+                    )
+                else:
+                    packed_hidden_states = block(
+                        packed_hidden_states,
+                        temb,
+                        adaln_indices,
+                        rotary_emb,
+                        None,
+                    )
 
         packed_hidden_states = self.norm_out(
             packed_hidden_states,
