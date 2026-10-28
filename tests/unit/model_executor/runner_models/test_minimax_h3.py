@@ -1410,6 +1410,51 @@ def test_minimax_h3_vae_tile_decodes_are_cudagraph_steps(monkeypatch, mode, step
     assert len(steps) == 3 * steps_per_decode
 
 
+def test_minimax_h3_cudagraph_audio_decoder_keeps_each_waveform(monkeypatch):
+    """Graph replays reuse one output buffer, and the waveform is kept until the request is saved."""
+    from xfuser.model_executor.models.runner_models.minimax_h3 import xFuserMiniMaxH3Model
+
+    steps = []
+    monkeypatch.setattr(torch.compiler, "cudagraph_mark_step_begin", lambda: steps.append(None))
+    monkeypatch.setattr("xfuser.model_executor.models.runner_models.minimax_h3.log", lambda message: None)
+    calls = []
+
+    def fake_compile(forward, **kwargs):
+        buffer = {}
+
+        def replay(hidden_states):
+            calls.append(None)
+            result = forward(hidden_states)
+            buffer.setdefault("out", torch.empty_like(result)).copy_(result)
+            return buffer["out"]
+
+        return replay
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    torch.manual_seed(0)
+    decoder = torch.nn.Sequential(torch.nn.utils.weight_norm(torch.nn.Conv1d(2, 2, 3, padding=1)))
+    with torch.no_grad():
+        decoder[0].weight_g.mul_(3)
+    audio_vae = torch.nn.Module()
+    audio_vae.decoder = decoder
+    first, second = torch.randn(2, 1, 2, 5).unbind(0)
+    with torch.no_grad():
+        expected_first, expected_second = decoder(first), decoder(second)
+    model = object.__new__(xFuserMiniMaxH3Model)
+    model._get_vae_compile_mode = lambda: "reduce-overhead"
+
+    model._compile_audio_vae_decoder(audio_vae)
+    with torch.no_grad():
+        actual_first = audio_vae.decoder(first)
+        actual_second = audio_vae.decoder(second)
+
+    torch.testing.assert_close(actual_first, expected_first)
+    torch.testing.assert_close(actual_second, expected_second)
+    # Both graph calls (warmup and recording) happen in the first request.
+    assert len(calls) == 3
+    assert len(steps) == 3
+
+
 def test_fasth3_warmup_uses_four_forward_schedule(monkeypatch):
     from xfuser.model_executor.models.runner_models.minimax_h3 import (
         xFuserFastH3Model,
