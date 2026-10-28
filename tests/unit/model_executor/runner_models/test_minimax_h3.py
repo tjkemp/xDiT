@@ -1258,6 +1258,7 @@ def test_minimax_h3_compile_preserves_forward_signature(monkeypatch):
     model.pipe = SimpleNamespace(transformer=transformer, vae=vae)
     model._enable_compute_comm_overlap = lambda: None
     model._get_compile_mode = lambda: "default"
+    model._get_vae_compile_mode = lambda: "default"
     model._run_timed_pipe = lambda input_args: None
     monkeypatch.setattr(
         "xfuser.model_executor.models.runner_models.minimax_h3.log",
@@ -1270,6 +1271,29 @@ def test_minimax_h3_compile_preserves_forward_signature(monkeypatch):
     assert "token_tags" in parameters
     assert "position_ids" in parameters
     assert compile_calls == [{"mode": "default", "fullgraph": False}]
+
+
+@pytest.mark.parametrize(("mode", "steps_per_decode"), [("reduce-overhead", 1), ("default", 0)])
+def test_minimax_h3_vae_tile_decodes_are_cudagraph_steps(monkeypatch, mode, steps_per_decode):
+    """Tiles replay the same block graphs, so a later tile must not see an earlier one's outputs as live."""
+    from xfuser.model_executor.models.runner_models.minimax_h3 import xFuserMiniMaxH3Model
+
+    steps = []
+    monkeypatch.setattr(torch.compiler, "cudagraph_mark_step_begin", lambda: steps.append(None))
+    monkeypatch.setattr("xfuser.model_executor.models.runner_models.minimax_h3.log", lambda message: None)
+    compile_calls = []
+    vae = torch.nn.Module()
+    vae.decoder = torch.nn.Identity()
+    vae.compile_repeated_blocks = lambda **kwargs: compile_calls.append(kwargs)
+    model = object.__new__(xFuserMiniMaxH3Model)
+    model._get_vae_compile_mode = lambda: mode
+
+    model._compile_vae_decoder_blocks(vae)
+    for _ in range(3):
+        vae.decoder(torch.zeros(1))
+
+    assert compile_calls == [{"mode": mode, "fullgraph": False}]
+    assert len(steps) == 3 * steps_per_decode
 
 
 def test_fasth3_warmup_uses_four_forward_schedule(monkeypatch):
