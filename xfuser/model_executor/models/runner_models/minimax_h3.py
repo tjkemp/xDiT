@@ -24,6 +24,7 @@ from xfuser.core.distributed import (
 from xfuser.core.utils.runner_utils import log
 from xfuser.core.utils.video_utils import encode_video_with_audio
 from xfuser.envs import get_device_name
+from xfuser.model_executor.layers import usp
 from xfuser.model_executor.models.runner_models.base_model import (
     DefaultInputValues,
     DiffusionOutput,
@@ -529,6 +530,8 @@ class xFuserMiniMaxH3Model(xFuserModel):
     _transformer_component_name = "transformer"
     _warmup_num_inference_steps = 3
     _enable_fasth3_vsa = False
+    # Used unless XDIT_ULYSSES_HEAD_CHUNKS is set.
+    _ulysses_head_chunks = 2
     supported_attn_backends = _SUPPORTED_ATTN_BACKENDS
 
     def _get_runtime_state_pipeline(self):
@@ -612,6 +615,8 @@ class xFuserMiniMaxH3Model(xFuserModel):
             raise ValueError(
                 f"Unsupported MiniMax-H3 task {config.task!r}. Supported tasks: {sorted(_SUPPORTED_TASKS)}."
             )
+        if "XDIT_ULYSSES_HEAD_CHUNKS" not in os.environ:
+            usp._ULYSSES_HEAD_CHUNKS = self._ulysses_head_chunks
 
     def preprocess_args(self, input_args: dict) -> dict:
         args = super().preprocess_args(input_args)
@@ -908,6 +913,7 @@ class xFuserFastH3Model(xFuserMiniMaxH3Model):
 
     _warmup_num_inference_steps = 4
     _enable_fasth3_vsa = True
+    _ulysses_head_chunks = 1
     supported_attn_backends = _SUPPORTED_ATTN_BACKENDS | _FASTH3_ATTN_BACKENDS
 
     def _customize_settings(self, config) -> None:
