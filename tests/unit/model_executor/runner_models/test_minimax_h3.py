@@ -14,6 +14,14 @@ pytest.importorskip(
 )
 
 
+@pytest.fixture(autouse=True)
+def _restore_ulysses_head_chunks(monkeypatch):
+    """Building a MiniMax-H3 runner sets USP's head-chunk count for the whole process."""
+    from xfuser.model_executor.layers import usp
+
+    monkeypatch.setattr(usp, "_ULYSSES_HEAD_CHUNKS", usp._ULYSSES_HEAD_CHUNKS)
+
+
 def _tiny_config():
     return {
         "num_attention_heads": 2,
@@ -352,6 +360,36 @@ def test_fasth3_dense_accepts_dense_backends_and_rejects_vsa(monkeypatch):
                 attention_backend="TRITON_VSA_H3",
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("model", "task", "env", "expected"),
+    [
+        ("MiniMaxAI/MiniMax-H3", "i2va", None, 2),
+        ("MiniMaxAI/MiniMax-H3", "i2va", "1", 1),
+        ("FastH3-Dense", "t2va", None, 1),
+    ],
+)
+def test_minimax_h3_splits_ulysses_attention_into_two_head_chunks_by_default(monkeypatch, model, task, env, expected):
+    from xfuser import xFuserArgs
+    from xfuser.model_executor.layers import usp
+    from xfuser.model_executor.models.runner_models.minimax_h3 import (
+        xFuserFastH3DenseModel,
+        xFuserMiniMaxH3Model,
+    )
+
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    if env is None:
+        monkeypatch.delenv("XDIT_ULYSSES_HEAD_CHUNKS", raising=False)
+    else:
+        monkeypatch.setenv("XDIT_ULYSSES_HEAD_CHUNKS", env)
+    usp._ULYSSES_HEAD_CHUNKS = int(env or 1)
+
+    runner = xFuserFastH3DenseModel if model == "FastH3-Dense" else xFuserMiniMaxH3Model
+    runner(xFuserArgs(model=model, task=task))
+
+    assert usp._ULYSSES_HEAD_CHUNKS == expected
 
 
 def test_fasth3_dense_allows_the_hybrid_attention_schedule(monkeypatch):
