@@ -1293,6 +1293,34 @@ def test_fasth3_warmup_uses_four_forward_schedule(monkeypatch):
     assert [call["num_inference_steps"] for call in calls] == [4, 4]
 
 
+def test_minimax_h3_schedule_steps_without_looking_up_the_first_timestep():
+    from diffusers import MiniMaxH3Scheduler
+
+    from xfuser.model_executor.models.runner_models.minimax_h3 import (
+        _count_steps_as_forwards,
+    )
+
+    def denoise(scheduler):
+        sample = torch.ones(2, 3)
+        for timestep in scheduler.timesteps:
+            sample = scheduler.step(torch.full_like(sample, 0.5), timestep, sample).prev_sample
+        return sample
+
+    reference = MiniMaxH3Scheduler(shift=5.0)
+    reference.set_timesteps(4)
+    scheduler = MiniMaxH3Scheduler(shift=5.0)
+    _count_steps_as_forwards(scheduler)
+    scheduler.set_timesteps(3)
+
+    def no_lookup(timestep):
+        raise AssertionError("the first step looked up its timestep index")
+
+    scheduler.index_for_timestep = no_lookup
+
+    assert len(scheduler.timesteps) == 3
+    assert torch.equal(denoise(scheduler), denoise(reference))
+
+
 def test_minimax_h3_ref2va_uses_typed_image_references(monkeypatch):
     from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3ImageReference
 

@@ -308,6 +308,8 @@ def _count_steps_as_forwards(scheduler) -> None:
     def set_timesteps(num_inference_steps, device=None):
         # MiniMaxH3Scheduler runs one step fewer than requested, so ask for one extra.
         set_grid_points(num_inference_steps + 1, device=device)
+        # Skips the first step's index lookup, which syncs the device.
+        scheduler.set_begin_index(0)
 
     scheduler.set_timesteps = set_timesteps
 
