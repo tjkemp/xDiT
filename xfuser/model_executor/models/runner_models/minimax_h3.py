@@ -371,6 +371,68 @@ def _patch_minimax_h3_text_encoder_broadcast() -> None:
     encoders._xfuser_broadcast_patched = True
 
 
+@functools.lru_cache(maxsize=None)
+def _device_constant(values: tuple, device: torch.device, shape: tuple) -> torch.Tensor:
+    return torch.tensor(values, device=device).view(shape)
+
+
+def _patch_minimax_h3_decode_constants() -> None:
+    """Build the decode steps' normalization constants on the device once.
+
+    diffusers builds them from Python lists on every request. Each one is a blocking
+    host-to-device copy that waits for the queued denoise or decode work to drain,
+    leaving the GPU idle until the host has queued work again.
+    """
+    from diffusers.modular_pipelines.minimax_h3 import decoders
+
+    if getattr(decoders, "_xfuser_decode_constants_patched", False):
+        return
+
+    def video_decode(self, components, state):
+        block_state = self.get_block_state(state)
+        device = components._execution_device
+
+        if block_state.output_type not in ("pil", "np", "pt"):
+            raise ValueError(
+                f"`output_type` must be one of 'pil', 'np' or 'pt', got {block_state.output_type!r}. To keep the "
+                "latents instead of decoding them, run a pipeline that does not include the decode blocks."
+            )
+
+        shape = (1, -1, 1, 1, 1)
+        latents_mean = _device_constant(tuple(components.vae.config.latents_mean), device, shape)
+        latents_std = _device_constant(tuple(components.vae.config.latents_std), device, shape)
+        latents = block_state.latents * latents_std + latents_mean
+
+        video = components.vae.decode(latents, return_dict=False)[0]
+        pixel_mean = _device_constant(tuple(components.pixel_mean), device, shape)
+        pixel_std = _device_constant(tuple(components.pixel_std), device, shape)
+        video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)
+        block_state.videos = components.video_processor.postprocess_video(video, output_type=block_state.output_type)
+
+        self.set_block_state(state, block_state)
+        return components, state
+
+    def audio_decode(self, components, state):
+        block_state = self.get_block_state(state)
+        device = components._execution_device
+
+        shape = (1, -1, 1)
+        audio_latents_mean = _device_constant(tuple(components.audio_vae.config.latents_mean), device, shape)
+        audio_latents_std = _device_constant(tuple(components.audio_vae.config.latents_std), device, shape)
+        audio_latents = block_state.audio_latents * audio_latents_std + audio_latents_mean
+
+        audio = components.audio_vae.decode(audio_latents, return_dict=False)[0]
+        block_state.audio = audio.float().permute(1, 0, 2)
+        block_state.sampling_rate = components.audio_sampling_rate
+
+        self.set_block_state(state, block_state)
+        return components, state
+
+    decoders.MiniMaxH3VideoDecodeStep.__call__ = torch.no_grad()(video_decode)
+    decoders.MiniMaxH3AudioDecodeStep.__call__ = torch.no_grad()(audio_decode)
+    decoders._xfuser_decode_constants_patched = True
+
+
 # build_row_timesteps gives every packed row one of four timesteps (generated
 # video, generated audio, conditioning video, reference audio) and hands the
 # transformer the distinct ones, so a step carries between one and four.
@@ -730,6 +792,7 @@ class xFuserMiniMaxH3Model(xFuserModel):
         log(f"Loading {self.settings.model_name} {workflow.upper()} components")
         if self.config.text_encoder_tp_degree <= 1:
             _patch_minimax_h3_text_encoder_broadcast()
+        _patch_minimax_h3_decode_constants()
         pipe = ModularPipeline.from_pretrained(
             self.settings.model_name,
             workflow=workflow,
@@ -1372,6 +1435,7 @@ class xFuserMiniMaxH3Ref2VAModel(xFuserMiniMaxH3Model):
         log(f"Loading {self.settings.model_name} Ref2VA components")
         if self.config.text_encoder_tp_degree <= 1:
             _patch_minimax_h3_text_encoder_broadcast()
+        _patch_minimax_h3_decode_constants()
         pipe = ModularPipeline.from_pretrained(
             self.settings.model_name,
             workflow="ref2va",
