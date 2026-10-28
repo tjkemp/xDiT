@@ -1064,6 +1064,66 @@ def test_minimax_h3_patches_shared_qwen_encoder_helper(monkeypatch):
     assert encoders._xfuser_broadcast_patched
 
 
+def test_minimax_h3_decode_steps_reuse_their_normalization_constants(monkeypatch):
+    """Each request decodes like diffusers, without rebuilding the constants from host lists."""
+    from diffusers.modular_pipelines.minimax_h3 import decoders
+
+    from xfuser.model_executor.models.runner_models import minimax_h3
+
+    for step in (decoders.MiniMaxH3VideoDecodeStep, decoders.MiniMaxH3AudioDecodeStep):
+        monkeypatch.setattr(step, "__call__", step.__call__)
+    monkeypatch.setattr(decoders, "_xfuser_decode_constants_patched", False, raising=False)
+    minimax_h3._device_constant.cache_clear()
+    components = SimpleNamespace(
+        _execution_device=torch.device("cpu"),
+        vae=SimpleNamespace(
+            config=SimpleNamespace(latents_mean=[0.5, -1.0, 2.0, 0.25], latents_std=[2.0, 0.5, 1.5, 3.0]),
+            decode=lambda latents, return_dict: (latents[:, :3] * 0.1,),
+        ),
+        pixel_mean=(0.485, 0.456, 0.406),
+        pixel_std=(0.229, 0.224, 0.225),
+        video_processor=SimpleNamespace(postprocess_video=lambda video, output_type: video),
+        audio_vae=SimpleNamespace(
+            config=SimpleNamespace(latents_mean=[0.1, 0.2, 0.3], latents_std=[1.5, 2.5, 0.5]),
+            decode=lambda latents, return_dict: (latents.sum(1, keepdim=True),),
+        ),
+        audio_sampling_rate=32000,
+    )
+    torch.manual_seed(0)
+    inputs = SimpleNamespace(
+        latents=torch.randn(1, 4, 2, 3, 3),
+        output_type="pt",
+        audio_latents=torch.randn(2, 3, 5),
+    )
+
+    def decode(step_cls):
+        step = step_cls()
+        block_state = SimpleNamespace(**vars(inputs))
+        step.get_block_state = lambda state: block_state
+        step.set_block_state = lambda state, value: None
+        step(components, state=None)
+        return block_state
+
+    expected_video = decode(decoders.MiniMaxH3VideoDecodeStep).videos
+    expected_audio = decode(decoders.MiniMaxH3AudioDecodeStep).audio
+    minimax_h3._patch_minimax_h3_decode_constants()
+    decode(decoders.MiniMaxH3VideoDecodeStep)
+    decode(decoders.MiniMaxH3AudioDecodeStep)
+
+    host_constants = []
+    original_tensor = torch.tensor
+    monkeypatch.setattr(
+        torch, "tensor", lambda *args, **kwargs: host_constants.append(args) or original_tensor(*args, **kwargs)
+    )
+    video = decode(decoders.MiniMaxH3VideoDecodeStep)
+    audio = decode(decoders.MiniMaxH3AudioDecodeStep)
+
+    assert host_constants == []
+    torch.testing.assert_close(video.videos, expected_video, rtol=0, atol=0)
+    torch.testing.assert_close(audio.audio, expected_audio, rtol=0, atol=0)
+    assert audio.sampling_rate == 32000
+
+
 def _attach_online_loader(model, monkeypatch):
     """Give a bare runner the checkpoint identity its loader would build online."""
     from xfuser.model_executor.models.runner_models.loading.meta_load import (
@@ -1136,6 +1196,7 @@ def test_minimax_h3_loads_task_workflow(
         "_patch_minimax_h3_text_encoder_broadcast",
         lambda: None,
     )
+    monkeypatch.setattr(minimax_h3, "_patch_minimax_h3_decode_constants", lambda: None)
     monkeypatch.setattr(minimax_h3, "log", lambda message: None)
 
     model = object.__new__(xFuserMiniMaxH3Model)
@@ -1194,6 +1255,7 @@ def test_fasth3_loads_published_checkpoint(monkeypatch):
         "_patch_minimax_h3_text_encoder_broadcast",
         lambda: None,
     )
+    monkeypatch.setattr(minimax_h3, "_patch_minimax_h3_decode_constants", lambda: None)
     monkeypatch.setattr(minimax_h3, "log", lambda message: None)
 
     model = object.__new__(xFuserFastH3Model)
@@ -1262,6 +1324,7 @@ def test_fasth3_dense_loads_published_checkpoint(monkeypatch):
         "_patch_minimax_h3_text_encoder_broadcast",
         lambda: None,
     )
+    monkeypatch.setattr(minimax_h3, "_patch_minimax_h3_decode_constants", lambda: None)
     monkeypatch.setattr(minimax_h3, "log", lambda message: None)
 
     model = object.__new__(xFuserFastH3DenseModel)
@@ -1323,6 +1386,7 @@ def test_minimax_h3_ref2va_loads_workflow(monkeypatch):
         "_patch_minimax_h3_text_encoder_broadcast",
         lambda: None,
     )
+    monkeypatch.setattr(minimax_h3, "_patch_minimax_h3_decode_constants", lambda: None)
     monkeypatch.setattr(minimax_h3, "log", lambda message: None)
 
     model = object.__new__(xFuserMiniMaxH3Ref2VAModel)
