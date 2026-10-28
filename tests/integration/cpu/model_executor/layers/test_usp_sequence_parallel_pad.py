@@ -58,6 +58,27 @@ def _inputs(torch, real_len):
     return query, key, value
 
 
+def _schedule_before_the_first_attention(torch, usp, rank, world_size):
+    """The (exchanges launched, waits) Inductor schedules before the first attention, under the runners' overlap passes."""
+    from torch._inductor.utils import run_and_get_code
+
+    torch._dynamo.reset()
+    local = _local_inputs(torch, rank, world_size, PADDED_LEN)
+    overlap = {
+        "reorder_for_compute_comm_overlap": True,
+        "reorder_for_compute_comm_overlap_passes": ["reorder_compute_for_overlap", "sink_waits", "raise_comms"],
+    }
+    with torch._inductor.config.patch(overlap):
+        _, codes = run_and_get_code(torch.compile(usp.USP, backend="inductor", fullgraph=True), *local)
+    launches = waits = 0
+    for line in codes[-1][codes[-1].index("def call(") :].splitlines():
+        if "_scaled_dot_product_flash_attention_for_cpu.default(" in line and "assert" not in line:
+            return launches, waits
+        launches += "all_to_all_single.default(" in line
+        waits += "wait_tensor.default(" in line
+    return None
+
+
 def _wire_usp_to_gloo(torch, ulysses, ring):
     """Point usp at yunchang's gloo groups and a CPU kernel that returns the log-sum-exp ring attention merges on.
 
@@ -211,7 +232,9 @@ def _packed_keys_error(torch, usp, rank, world_size):
     return None
 
 
-def _worker(rank, world_size, init_method, result_queue, ulysses, ring, compile_backends, cases, scenario="plain"):
+def _worker(
+    rank, world_size, init_method, result_queue, ulysses, ring, compile_backends, cases, scenario="plain", head_chunks=1
+):
     # The CPU path is the one under test, whatever accelerators the machine has.
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["HIP_VISIBLE_DEVICES"] = ""
@@ -222,6 +245,7 @@ def _worker(rank, world_size, init_method, result_queue, ulysses, ring, compile_
 
         dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=world_size)
         usp = _wire_usp_to_gloo(torch, ulysses, ring)
+        usp._ULYSSES_HEAD_CHUNKS = head_chunks
         if scenario == "plain":
 
             def run_cases(attention):
@@ -233,6 +257,8 @@ def _worker(rank, world_size, init_method, result_queue, ulysses, ring, compile_
                 return _run_joint_cases(torch, usp, rank, world_size, attention)
 
         report = {"errors": {"eager": run_cases(usp.USP)}, "graph_breaks": {}}
+        if head_chunks > 1 and "inductor" in compile_backends:
+            report["schedule"] = _schedule_before_the_first_attention(torch, usp, rank, world_size)
         for backend in compile_backends:
             torch._dynamo.reset()
             torch._dynamo.utils.counters.clear()
@@ -281,8 +307,8 @@ def _compile_backends():
     return ["aot_eager"] + (["inductor"] if any(cxx and shutil.which(cxx) for cxx in config.cpp.cxx) else [])
 
 
-@pytest.mark.parametrize("mode", MODES)
-def test_usp_matches_attention_over_the_real_tokens(tmp_path, mode):
+@pytest.mark.parametrize(("mode", "head_chunks"), [*((mode, 1) for mode in MODES), ("ulysses", 2)])
+def test_usp_matches_attention_over_the_real_tokens(tmp_path, mode, head_chunks):
     torch = pytest.importorskip("torch")
     pytest.importorskip("yunchang", reason="yunchang builds the Ulysses and ring process groups")
     if not torch.distributed.is_gloo_available():
@@ -292,7 +318,11 @@ def test_usp_matches_attention_over_the_real_tokens(tmp_path, mode):
     compile_backends = _compile_backends()
 
     exit_codes, results = _run_spawned(
-        torch, f"file://{tmp_path / 'usp-init'}", world_size, (ulysses, ring, compile_backends, CASES), timeout=900
+        torch,
+        f"file://{tmp_path / 'usp-init'}",
+        world_size,
+        (ulysses, ring, compile_backends, CASES, "plain", head_chunks),
+        timeout=900,
     )
 
     errors = [result for result in results if result[0] == "error"]
@@ -304,6 +334,9 @@ def test_usp_matches_attention_over_the_real_tokens(tmp_path, mode):
             for case, error in case_errors.items():
                 assert error <= TOLERANCE, f"rank {rank}, {variant}, {case}: max error {error:.3e}"
         assert report["graph_breaks"] == {backend: 0 for backend in compile_backends}, f"rank {rank}"
+        if "schedule" in report:
+            # Every chunk's input exchange is in flight before the first chunk attends, which waits only for its own.
+            assert report["schedule"] == (head_chunks, 1), f"rank {rank}"
         if ring > 1:
             assert report["packed_keys_error"] is not None and "valid_kv_len must be in" in report["packed_keys_error"]
 
