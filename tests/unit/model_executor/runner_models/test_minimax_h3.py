@@ -886,7 +886,9 @@ def test_vdn_step_count_runs_the_distilled_9_point_grid(monkeypatch):
         xFuserVDNMiniMaxH3Model._validate_args(model, {"num_inference_steps": 9})
 
     grid_points = []
-    scheduler = SimpleNamespace(set_timesteps=lambda n, device=None: grid_points.append(n))
+    scheduler = SimpleNamespace(
+        set_timesteps=lambda n, device=None: grid_points.append(n), set_begin_index=lambda index: None
+    )
     _count_steps_as_forwards(scheduler)
     scheduler.set_timesteps(xFuserVDNMiniMaxH3Model.default_input_values.num_inference_steps)
     assert grid_points == [9]
@@ -1733,6 +1735,34 @@ def test_fasth3_warmup_uses_four_forward_schedule(monkeypatch):
 
     assert input_args["num_inference_steps"] == 50
     assert [call["num_inference_steps"] for call in calls] == [4, 4]
+
+
+def test_minimax_h3_schedule_steps_without_looking_up_the_first_timestep():
+    from diffusers import MiniMaxH3Scheduler
+
+    from xfuser.model_executor.models.runner_models.minimax_h3 import (
+        _count_steps_as_forwards,
+    )
+
+    def denoise(scheduler):
+        sample = torch.ones(2, 3)
+        for timestep in scheduler.timesteps:
+            sample = scheduler.step(torch.full_like(sample, 0.5), timestep, sample).prev_sample
+        return sample
+
+    reference = MiniMaxH3Scheduler(shift=5.0)
+    reference.set_timesteps(4)
+    scheduler = MiniMaxH3Scheduler(shift=5.0)
+    _count_steps_as_forwards(scheduler)
+    scheduler.set_timesteps(3)
+
+    def no_lookup(timestep):
+        raise AssertionError("the first step looked up its timestep index")
+
+    scheduler.index_for_timestep = no_lookup
+
+    assert len(scheduler.timesteps) == 3
+    assert torch.equal(denoise(scheduler), denoise(reference))
 
 
 def test_minimax_h3_ref2va_uses_typed_image_references(monkeypatch):
