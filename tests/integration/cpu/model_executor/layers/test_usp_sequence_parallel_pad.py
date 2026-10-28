@@ -25,14 +25,16 @@ CASES = {
     "declared-pad": dict(real_len=45, declared=True),
     "declared-pad-causal": dict(real_len=45, declared=True, causal=True),
 }
-# (Ulysses, ring, head chunks) degrees. At ring degree 4 only one of a rank's four steps attends to the pad.
+# (Ulysses, ring, head chunks, separate q/k/v exchanges). At ring degree 4 only one of a rank's four steps
+# attends to the pad.
 MODES = {
-    "ulysses": (2, 1, 1),
-    "ulysses-head-chunks": (2, 1, 2),
-    "ring": (1, 2, 1),
-    "hybrid": (2, 2, 1),
-    "ring4": (1, 4, 1),
-    "hybrid-ring4": (2, 4, 1),
+    "ulysses": (2, 1, 1, False),
+    "ulysses-head-chunks": (2, 1, 2, False),
+    "ulysses-head-chunks-split-qkv": (2, 1, 2, True),
+    "ring": (1, 2, 1, False),
+    "hybrid": (2, 2, 1, False),
+    "ring4": (1, 4, 1, False),
+    "hybrid-ring4": (2, 4, 1, False),
 }
 # Every variant computes in fp32 on the same CPU kernel; the leak of an attended pad is several orders larger.
 TOLERANCE = 1e-5
@@ -157,7 +159,7 @@ def _packed_keys_error(torch, usp, rank, world_size):
     return None
 
 
-def _worker(rank, world_size, init_method, result_queue, ulysses, ring, head_chunks, compile_backends):
+def _worker(rank, world_size, init_method, result_queue, ulysses, ring, head_chunks, split_qkv, compile_backends):
     # The CPU path is the one under test, whatever accelerators the machine has.
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["HIP_VISIBLE_DEVICES"] = ""
@@ -169,6 +171,7 @@ def _worker(rank, world_size, init_method, result_queue, ulysses, ring, head_chu
         dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=world_size)
         usp = _wire_usp_to_gloo(torch, ulysses, ring)
         usp._ULYSSES_HEAD_CHUNKS = head_chunks
+        usp._ULYSSES_SPLIT_QKV = split_qkv
         report = {"errors": {"eager": _run_cases(torch, usp, rank, world_size, usp.USP)}, "graph_breaks": {}}
         if head_chunks > 1 and "inductor" in compile_backends:
             report["schedule"] = _schedule_before_the_first_attention(torch, usp, rank, world_size)
@@ -226,7 +229,7 @@ def test_usp_matches_attention_over_the_real_tokens(tmp_path, mode):
     pytest.importorskip("yunchang", reason="yunchang builds the Ulysses and ring process groups")
     if not torch.distributed.is_gloo_available():
         pytest.skip("torch.distributed gloo backend is unavailable")
-    ulysses, ring, head_chunks = MODES[mode]
+    ulysses, ring, head_chunks, split_qkv = MODES[mode]
     world_size = ulysses * ring
     compile_backends = _compile_backends()
 
@@ -234,7 +237,7 @@ def test_usp_matches_attention_over_the_real_tokens(tmp_path, mode):
         torch,
         f"file://{tmp_path / 'usp-init'}",
         world_size,
-        (ulysses, ring, head_chunks, compile_backends),
+        (ulysses, ring, head_chunks, split_qkv, compile_backends),
         timeout=900,
     )
 
@@ -249,6 +252,7 @@ def test_usp_matches_attention_over_the_real_tokens(tmp_path, mode):
         assert report["graph_breaks"] == {backend: 0 for backend in compile_backends}, f"rank {rank}"
         if "schedule" in report:
             # Every chunk's input exchange is in flight before the first chunk attends, which waits only for its own.
-            assert report["schedule"] == (head_chunks, 1), f"rank {rank}"
+            exchanges = 3 if split_qkv else 1
+            assert report["schedule"] == (exchanges * head_chunks, exchanges), f"rank {rank}"
         if ring > 1:
             assert report["packed_keys_error"] is not None and "valid_kv_len must be in" in report["packed_keys_error"]

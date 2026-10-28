@@ -72,6 +72,7 @@ def _warn_fp8_comms_missing_attn():
 # through the same Ulysses exchange without knowing what they mean.
 ULYSSES_EXTRA_INPUTS_KEY = "ulysses_extra_inputs"
 _ULYSSES_HEAD_CHUNKS = envs.XDIT_ULYSSES_HEAD_CHUNKS
+_ULYSSES_SPLIT_QKV = envs.XDIT_ULYSSES_SPLIT_QKV
 
 
 def ring_attn(
@@ -301,20 +302,41 @@ def _overlapped_ulysses_attention(attention_function, query, key, value, chunk_s
     """
     world_size = get_ulysses_parallel_world_size()
     batch, heads, seq_len, head_dim = query.shape
-    qkv = torch.stack([query, key, value]).view(3, batch, world_size, heads // world_size, seq_len, head_dim)
-    received = [
-        _start_ulysses_all_to_all(chunk.permute(2, 0, 1, 3, 4, 5).contiguous())
-        for chunk in qkv.split(chunk_sizes, dim=3)
-    ]
+    if _ULYSSES_SPLIT_QKV:
+        # [rank, batch, seq, heads, dim] per tensor arrives as BSHD for batch 1, which is what mha_v4 reads.
+        bshd = [
+            t.transpose(1, 2).reshape(batch, seq_len, world_size, heads // world_size, head_dim)
+            for t in (query, key, value)
+        ]
+        received = [
+            [_start_ulysses_all_to_all(chunk.permute(2, 0, 1, 3, 4).contiguous()) for chunk in chunks]
+            for chunks in zip(*(t.split(chunk_sizes, dim=3) for t in bshd))
+        ]
+    else:
+        qkv = torch.stack([query, key, value]).view(3, batch, world_size, heads // world_size, seq_len, head_dim)
+        received = [
+            _start_ulysses_all_to_all(chunk.permute(2, 0, 1, 3, 4, 5).contiguous())
+            for chunk in qkv.split(chunk_sizes, dim=3)
+        ]
     sent = []
     for size, chunk in zip(chunk_sizes, received):
-        chunk = torch.ops._c10d_functional.wait_tensor(chunk)
-        chunk_query, chunk_key, chunk_value = (
-            chunk.view(world_size, 3, batch, size, seq_len, head_dim)
-            .permute(1, 2, 3, 0, 4, 5)
-            .reshape(3, batch, size, world_size * seq_len, head_dim)
-            .unbind(0)
-        )
+        if _ULYSSES_SPLIT_QKV:
+            chunk_query, chunk_key, chunk_value = (
+                torch.ops._c10d_functional.wait_tensor(t)
+                .view(world_size, batch, seq_len, size, head_dim)
+                .transpose(0, 1)
+                .reshape(batch, world_size * seq_len, size, head_dim)
+                .transpose(1, 2)
+                for t in chunk
+            )
+        else:
+            chunk = torch.ops._c10d_functional.wait_tensor(chunk)
+            chunk_query, chunk_key, chunk_value = (
+                chunk.view(world_size, 3, batch, size, seq_len, head_dim)
+                .permute(1, 2, 3, 0, 4, 5)
+                .reshape(3, batch, size, world_size * seq_len, head_dim)
+                .unbind(0)
+            )
         chunk_key, chunk_value, attention_kwargs = drop_kv_padding(chunk_key, chunk_value)
         out, _ = attention_function(
             chunk_query, chunk_key, chunk_value, joint_attn_kwargs=None, attention_kwargs=attention_kwargs, **kwargs
