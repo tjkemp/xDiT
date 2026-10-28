@@ -58,6 +58,9 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     #       quantise and broadcast work, at the cost of a second shard resident.
     # These are reclaimable file-backed pages that the fill drops as it finishes each shard.
     "XDIT_WARM_SHARDS": lambda: os.environ.get("XDIT_WARM_SHARDS", "2"),
+    # Split Ulysses attention into this many head chunks, so each chunk's all-to-all overlaps
+    # another chunk's attention. 1 keeps one exchange each way.
+    "XDIT_ULYSSES_HEAD_CHUNKS": lambda: int(os.environ.get("XDIT_ULYSSES_HEAD_CHUNKS", "1")),
 }
 
 

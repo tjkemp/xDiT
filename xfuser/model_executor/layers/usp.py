@@ -71,6 +71,7 @@ def _warn_fp8_comms_missing_attn():
 # lists their ``attention_kwargs`` keys under this one, and USP carries them
 # through the same Ulysses exchange without knowing what they mean.
 ULYSSES_EXTRA_INPUTS_KEY = "ulysses_extra_inputs"
+_ULYSSES_HEAD_CHUNKS = envs.XDIT_ULYSSES_HEAD_CHUNKS
 
 
 def ring_attn(
@@ -273,6 +274,61 @@ def _validate_gqa_params(
         raise NotImplementedError("GQA KV repetition does not support joint tensors.")
 
 
+def _start_ulysses_all_to_all(x):
+    """Launch an even all-to-all over the Ulysses group without waiting for it.
+
+    ``ft_c.all_to_all_single`` waits as soon as it is traced, so a compiled
+    graph could not overlap the exchange with anything.
+    """
+    x = x.flatten()
+    world_size = get_ulysses_parallel_world_size()
+    split_sizes = [x.numel() // world_size] * world_size
+    group_name = ft_c._resolve_group_name(PROCESS_GROUP.ULYSSES_PG)
+    return torch.ops._c10d_functional.all_to_all_single(x, split_sizes, split_sizes, group_name)
+
+
+def _ulysses_head_chunk_sizes(heads_per_rank):
+    chunks = max(1, min(_ULYSSES_HEAD_CHUNKS, heads_per_rank))
+    size, larger = divmod(heads_per_rank, chunks)
+    return [size + (chunk < larger) for chunk in range(chunks)]
+
+
+def _overlapped_ulysses_attention(attention_function, query, key, value, chunk_sizes, drop_kv_padding, **kwargs):
+    """Ulysses attention over head chunks, each chunk's exchanges overlapping another chunk's attention.
+
+    Every input exchange is launched up front; a chunk waits only for its own
+    before attending, then launches its output exchange.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    batch, heads, seq_len, head_dim = query.shape
+    qkv = torch.stack([query, key, value]).view(3, batch, world_size, heads // world_size, seq_len, head_dim)
+    received = [
+        _start_ulysses_all_to_all(chunk.permute(2, 0, 1, 3, 4, 5).contiguous())
+        for chunk in qkv.split(chunk_sizes, dim=3)
+    ]
+    sent = []
+    for size, chunk in zip(chunk_sizes, received):
+        chunk = torch.ops._c10d_functional.wait_tensor(chunk)
+        chunk_query, chunk_key, chunk_value = (
+            chunk.view(world_size, 3, batch, size, seq_len, head_dim)
+            .permute(1, 2, 3, 0, 4, 5)
+            .reshape(3, batch, size, world_size * seq_len, head_dim)
+            .unbind(0)
+        )
+        chunk_key, chunk_value, attention_kwargs = drop_kv_padding(chunk_key, chunk_value)
+        out, _ = attention_function(
+            chunk_query, chunk_key, chunk_value, joint_attn_kwargs=None, attention_kwargs=attention_kwargs, **kwargs
+        )
+        sent.append(_start_ulysses_all_to_all(out.permute(2, 0, 1, 3).contiguous()))
+    outputs = [
+        torch.ops._c10d_functional.wait_tensor(chunk)
+        .view(world_size, seq_len, batch, size, head_dim)
+        .permute(2, 0, 3, 1, 4)
+        for size, chunk in zip(chunk_sizes, sent)
+    ]
+    return torch.cat(outputs, dim=2).reshape(batch, heads, seq_len, head_dim)
+
+
 def _ft_c_output_all_to_all(x):
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
@@ -393,6 +449,18 @@ _SPARSITY_STRIPPING_SP_PAD = (Sparsity.SPARGE, Sparsity.VSA)
 def _backend_strips_sp_pad(backend, attention_kwargs) -> bool:
     spec = attention_registry.find(backend)
     return spec is not None and spec.sparsity in _SPARSITY_STRIPPING_SP_PAD and attention_kwargs.get("thw") is not None
+
+
+def _drop_trailing_kv_padding(key, value, attention_kwargs, is_causal, backend):
+    """Trim a declared trailing pad from K/V unless causality or the backend already hides it."""
+    if (attention_kwargs or {}).get("valid_kv_len") is None:
+        return key, value, attention_kwargs
+    # Causality already hides a trailing pad from every real query, and the
+    # untrimmed equal lengths leave no room for the backends' differing
+    # alignment of a causal mask over a shorter K/V.
+    if is_causal or _backend_strips_sp_pad(backend, attention_kwargs):
+        return key, value, attention_kwargs
+    return _trim_trailing_kv_padding(key, value, attention_kwargs, backend)
 
 
 def _ring_trim_trailing_kv_padding(attention_function, valid_kv_len, shard_len):
@@ -639,8 +707,26 @@ def USP(
 
     extra_inputs = _ulysses_extra_inputs(attention_kwargs, query)
 
+    ulysses_world_size = get_ulysses_parallel_world_size()
+    chunk_sizes = None
+    if (
+        ulysses_world_size > 1
+        and get_ring_parallel_world_size() == 1
+        and fp8_comms is None
+        and not joint_strategy
+        and kv_head_repeat == 1
+        and not hb_applied
+        and not extra_inputs
+        and not _has_kv_cache(attn_layer)
+        and query.shape == key.shape == value.shape
+        and query.shape[1] % ulysses_world_size == 0
+    ):
+        chunk_sizes = _ulysses_head_chunk_sizes(query.shape[1] // ulysses_world_size)
+        if len(chunk_sizes) == 1:
+            chunk_sizes = None
+
     qkv_amaxes = None
-    if get_ulysses_parallel_world_size() > 1:
+    if ulysses_world_size > 1 and chunk_sizes is None:
         if fp8_comms is not None:
             if extra_inputs:
                 raise NotImplementedError(
@@ -677,23 +763,35 @@ def USP(
     if _has_kv_cache(attn_layer):
         key, value = _update_and_get_kv_cache(key, value, attn_layer)
 
+    if chunk_sizes is not None:
+        out = _overlapped_ulysses_attention(
+            attention_function,
+            query,
+            key,
+            value,
+            chunk_sizes,
+            lambda key, value: _drop_trailing_kv_padding(key, value, attention_kwargs, is_causal, hb_backend),
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+        )
+        if fp8_module is not None:
+            fp8_observe_output(get_runtime_state().fp8_comms, fp8_module, out, False)
+        return out
+
     # Uniform trailing padding needs no mask or varlen packing. Keeping all Q
     # rows but slicing K/V is equivalent to masking those keys and lets dense
     # backends retain their optimized cross-attention path.
     valid_kv_len = (attention_kwargs or {}).get("valid_kv_len")
-    if valid_kv_len is None:
-        pass
-    elif is_causal:
-        # Causality already hides a trailing pad from every real query, and the
-        # untrimmed equal lengths leave no room for the backends' differing
-        # alignment of a causal mask over a shorter K/V.
-        pass
-    elif _backend_strips_sp_pad(hb_backend, attention_kwargs):
-        pass
-    elif get_ring_parallel_world_size() > 1 and attention_kwargs.get("indices_k") is None:
+    if (
+        valid_kv_len is not None
+        and not is_causal
+        and not _backend_strips_sp_pad(hb_backend, attention_kwargs)
+        and get_ring_parallel_world_size() > 1
+        and attention_kwargs.get("indices_k") is None
+    ):
         attention_function = _ring_trim_trailing_kv_padding(attention_function, valid_kv_len, key.shape[2])
     else:
-        key, value, attention_kwargs = _trim_trailing_kv_padding(key, value, attention_kwargs, hb_backend)
+        key, value, attention_kwargs = _drop_trailing_kv_padding(key, value, attention_kwargs, is_causal, hb_backend)
 
     if kv_head_repeat > 1:
         key, value = _repeat_kv_heads(key, value, kv_head_repeat)
