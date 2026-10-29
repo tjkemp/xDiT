@@ -9,7 +9,8 @@ own so the attention backend gets a contiguous K/V. Here one program covers
 ``BLOCK_ROWS`` ``(token, head)`` rows of ``D`` channels and writes contiguous
 ``[B, S, H, D]`` q, k and v in a single pass over QKV. The rotate-half partner
 of channel ``c`` is ``c +- rotary_dim / 2`` in the same head, so it is a second
-load of the same cache lines rather than a second pass over memory.
+load of the same cache lines rather than a second pass over memory. The Ulysses
+variant stores the same rows straight into USP's chunked send buffers instead.
 
 Numerics
 --------
@@ -75,7 +76,7 @@ if _HAS_TRITON:
             triton.Config({"BLOCK_ROWS": rows}, num_warps=warps)
             for rows, warps in ((8, 2), (16, 4), (32, 4), (32, 8), (64, 8))
         ],
-        key=["H", "D", "ROTARY_DIM"],
+        key=["H", "D", "ROTARY_DIM", "WORLD", "CHUNK", "LARGER"],
     )
     @triton.jit
     def _qkv_norm_rope_kernel(
@@ -96,6 +97,9 @@ if _HAS_TRITON:
         H: tl.constexpr,
         D: tl.constexpr,
         ROTARY_DIM: tl.constexpr,
+        WORLD: tl.constexpr,
+        CHUNK: tl.constexpr,
+        LARGER: tl.constexpr,
         BLOCK_ROWS: tl.constexpr,
     ):
         rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
@@ -111,7 +115,21 @@ if _HAS_TRITON:
 
         mask = row_mask[:, None]
         src = qkv_ptr + (token.to(tl.int64) * qkv_token_stride + head * D)[:, None]
-        dst = (rows.to(tl.int64) * D)[:, None] + cols[None, :]
+
+        # Head h goes to rank h // (H / WORLD); its local heads are split into LARGER chunks of
+        # CHUNK + 1 then chunks of CHUNK, each stored as [rank, token, chunk head, D] after the last.
+        rank = head // (H // WORLD)
+        local = head % (H // WORLD)
+        in_larger = local < LARGER * (CHUNK + 1)
+        start = tl.where(
+            in_larger,
+            local // (CHUNK + 1) * (CHUNK + 1),
+            LARGER * (CHUNK + 1) + (local - LARGER * (CHUNK + 1)) // CHUNK * CHUNK,
+        )
+        width = tl.where(in_larger, CHUNK + 1, CHUNK)
+        n_tokens = (n_rows // H).to(tl.int64)
+        dst_row = start * WORLD * n_tokens + (rank * n_tokens + token) * width + local - start
+        dst = (dst_row * D)[:, None] + cols[None, :]
 
         freq = ((token % seq_len).to(tl.int64) * freq_row_stride)[:, None] + cols[None, :]
         freq_mask = mask & rotated[None, :]
@@ -154,20 +172,8 @@ if _HAS_TRITON:
         value = tl.load(src + 2 * H * D + cols[None, :], mask=mask)
         tl.store(v_ptr + dst, value, mask=mask)
 
-    @triton_op("xfuser::minimax_h3_qkv_norm_rope", mutates_args=())
-    def _qkv_norm_rope(
-        qkv: torch.Tensor,
-        wq: torch.Tensor,
-        wk: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        heads: int,
-        eps_q: float,
-        eps_k: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _launch(qkv, wq, wk, cos, sin, heads, eps_q, eps_k, shape, world, chunk, larger):
         batch, seq_len, width = qkv.shape
-        head_dim = width // (3 * heads)
-        shape = (batch, seq_len, heads, head_dim)
         query, key, value = qkv.new_empty(shape), qkv.new_empty(shape), qkv.new_empty(shape)
         n_rows = batch * seq_len * heads
 
@@ -190,10 +196,45 @@ if _HAS_TRITON:
             eps_q,
             eps_k,
             H=heads,
-            D=head_dim,
+            D=width // (3 * heads),
             ROTARY_DIM=cos.shape[-1],
+            WORLD=world,
+            CHUNK=chunk,
+            LARGER=larger,
         )
         return query, key, value
+
+    @triton_op("xfuser::minimax_h3_qkv_norm_rope", mutates_args=())
+    def _qkv_norm_rope(
+        qkv: torch.Tensor,
+        wq: torch.Tensor,
+        wk: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        heads: int,
+        eps_q: float,
+        eps_k: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch, seq_len, width = qkv.shape
+        shape = (batch, seq_len, heads, width // (3 * heads))
+        return _launch(qkv, wq, wk, cos, sin, heads, eps_q, eps_k, shape, 1, heads, 0)
+
+    @triton_op("xfuser::minimax_h3_qkv_norm_rope_ulysses", mutates_args=())
+    def _qkv_norm_rope_ulysses(
+        qkv: torch.Tensor,
+        wq: torch.Tensor,
+        wk: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        heads: int,
+        eps_q: float,
+        eps_k: float,
+        world_size: int,
+        chunk: int,
+        larger: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Flat q, k and v, each holding its head chunks' send buffers one after another."""
+        return _launch(qkv, wq, wk, cos, sin, heads, eps_q, eps_k, (qkv.numel() // 3,), world_size, chunk, larger)
 
 
 def _reference(qkv, norm_q, norm_k, cos, sin, heads):
@@ -255,3 +296,58 @@ def minimax_h3_qkv_norm_rope(
             float(norm_k.eps),
         )
     return _reference(qkv, norm_q, norm_k, cos, sin, heads)
+
+
+def _chunk_layout(chunk_sizes):
+    """``(chunk, larger)`` when the sizes are ``larger`` chunks of ``chunk + 1`` heads then chunks of ``chunk``."""
+    chunk = chunk_sizes[-1]
+    larger = sum(size == chunk + 1 for size in chunk_sizes)
+    if chunk < 1 or list(chunk_sizes) != [chunk + 1] * larger + [chunk] * (len(chunk_sizes) - larger):
+        return None
+    return chunk, larger
+
+
+def minimax_h3_qkv_norm_rope_ulysses(
+    qkv: torch.Tensor,
+    norm_q: torch.nn.Module,
+    norm_k: torch.nn.Module,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    heads: int,
+    world_size: int,
+    chunk_sizes: list[int],
+) -> list[list[torch.Tensor]]:
+    """:func:`minimax_h3_qkv_norm_rope`, written as USP's chunked send buffers.
+
+    Returns what :func:`~xfuser.model_executor.layers.usp.ulysses_send_buffers` returns for the
+    same q, k and v.
+    """
+    from xfuser.model_executor.layers.usp import ulysses_send_buffers
+
+    layout = _chunk_layout(chunk_sizes)
+    if layout is None or not _fused_supported(qkv, norm_q, norm_k, cos, sin, heads):
+        query, key, value = _reference(qkv, norm_q, norm_k, cos, sin, heads)
+        return ulysses_send_buffers(
+            query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), world_size, chunk_sizes
+        )
+
+    batch, seq_len, width = qkv.shape
+    head_dim = width // (3 * heads)
+    flat = torch.ops.xfuser.minimax_h3_qkv_norm_rope_ulysses(
+        qkv,
+        norm_q.weight,
+        norm_k.weight,
+        cos,
+        sin,
+        heads,
+        float(norm_q.eps),
+        float(norm_k.eps),
+        world_size,
+        *layout,
+    )
+    buffers, offset = [], 0
+    for size in chunk_sizes:
+        numel = world_size * batch * seq_len * size * head_dim
+        buffers.append([t[offset : offset + numel].view(world_size, batch, seq_len, size, head_dim) for t in flat])
+        offset += numel
+    return buffers

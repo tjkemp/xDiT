@@ -289,3 +289,55 @@ def test_usp_refuses_packed_keys_together_with_ring_attention(ring_of_two):
     }
     with pytest.raises(ValueError, match="valid_kv_len must be in"):
         usp.USP(*local, attention_kwargs=attention_kwargs)
+
+
+def _chunked_ulysses(monkeypatch, *, ulysses=8, ring=1, fp8_comms=None, head_balance=False):
+    runtime_state = SimpleNamespace(
+        fp8_comms=fp8_comms,
+        attention_backend=next(iter(usp._HEAD_BALANCE_BACKENDS)),
+        runtime_config=SimpleNamespace(use_spargeattn_head_balance=head_balance),
+    )
+    monkeypatch.setattr(usp, "get_runtime_state", lambda: runtime_state)
+    monkeypatch.setattr(usp, "get_ulysses_parallel_world_size", lambda: ulysses)
+    monkeypatch.setattr(usp, "get_ring_parallel_world_size", lambda: ring)
+    monkeypatch.setattr(usp, "_ULYSSES_HEAD_CHUNKS", 2)
+
+
+def test_ulysses_head_chunks_split_each_ranks_heads(monkeypatch):
+    _chunked_ulysses(monkeypatch)
+
+    assert usp.ulysses_head_chunks(56, head_balance_layer=SimpleNamespace(head_perm=None)) == [4, 3]
+
+
+@pytest.mark.parametrize(
+    "setup, kwargs",
+    [
+        ({"ulysses": 1}, {}),
+        ({"ring": 2}, {}),
+        ({}, {"heads": 60}),
+        ({}, {"heads": 8}),
+        ({"fp8_comms": object()}, {}),
+        ({"head_balance": True}, {"head_balance_layer": SimpleNamespace(head_perm=torch.arange(56))}),
+        ({}, {"attention_kwargs": {usp.ULYSSES_EXTRA_INPUTS_KEY: ("gate",)}}),
+    ],
+    ids=["no-ulysses", "ring", "indivisible-heads", "one-head-per-rank", "fp8-comms", "head-balance", "extra-inputs"],
+)
+def test_ulysses_head_chunks_refuse_what_the_chunked_path_skips(monkeypatch, setup, kwargs):
+    _chunked_ulysses(monkeypatch, **setup)
+
+    assert usp.ulysses_head_chunks(kwargs.pop("heads", 56), **kwargs) is None
+
+
+def test_ulysses_send_buffers_hold_each_ranks_chunk_as_bshd():
+    world_size, chunk_sizes = 2, [2, 1]
+    tensors = [torch.randn(2, 6, 5, 4) for _ in range(3)]
+
+    buffers = usp.ulysses_send_buffers(*tensors, world_size, chunk_sizes)
+
+    assert len(buffers) == len(chunk_sizes)
+    for chunk, start, size in zip(buffers, (0, 2), chunk_sizes):
+        for buffer, tensor in zip(chunk, tensors, strict=True):
+            assert buffer.is_contiguous()
+            for rank in range(world_size):
+                heads = slice(rank * 3 + start, rank * 3 + start + size)
+                assert torch.equal(buffer[rank], tensor[:, heads].transpose(1, 2))

@@ -74,6 +74,28 @@ def test_in_envelope_call_selects_the_fused_kernel():
         assert torch.equal(actual, expected)
 
 
+@pytest.mark.parametrize(
+    "batch, heads, world_size, chunk_sizes",
+    [(1, 56, 8, [4, 3]), (2, 28, 4, [3, 2, 2]), (1, 8, 2, [2, 2])],
+)
+def test_ulysses_variant_writes_the_packed_bshd_result(batch, heads, world_size, chunk_sizes):
+    from xfuser.model_executor.layers.usp import ulysses_send_buffers
+
+    inputs = _inputs(batch, 40, heads=heads)
+
+    with torch.no_grad():
+        buffers = fused.minimax_h3_qkv_norm_rope_ulysses(*inputs, world_size, chunk_sizes)
+        query, key, value = fused.minimax_h3_qkv_norm_rope(*inputs)
+    expected = ulysses_send_buffers(
+        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), world_size, chunk_sizes
+    )
+
+    for chunk, expected_chunk in zip(buffers, expected, strict=True):
+        for actual, packed in zip(chunk, expected_chunk, strict=True):
+            assert actual.is_contiguous()
+            assert torch.equal(actual, packed)
+
+
 def test_grad_enabled_call_runs_the_reference():
     inputs = _inputs(1, 32)
 

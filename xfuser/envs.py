@@ -61,9 +61,6 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # Split Ulysses attention into this many head chunks, so each chunk's all-to-all overlaps
     # another chunk's attention. 1 keeps one exchange each way.
     "XDIT_ULYSSES_HEAD_CHUNKS": lambda: int(os.environ.get("XDIT_ULYSSES_HEAD_CHUNKS", "1")),
-    # Temporary A/B: exchange each head chunk's q, k and v separately, so they arrive in the
-    # attention layout without a copy.
-    "XDIT_ULYSSES_SPLIT_QKV": lambda: os.environ.get("XDIT_ULYSSES_SPLIT_QKV", "0") == "1",
 }
 
 
