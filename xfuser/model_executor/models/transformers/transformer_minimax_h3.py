@@ -156,14 +156,11 @@ class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
 
 
 class xFuserMiniMaxH3TransformerBlock(MiniMaxH3TransformerBlock):
-    """MiniMax-H3 block that can leave its feed-forward residual to the next block.
+    """MiniMax-H3 block that can defer its feed-forward residual to the next block.
 
-    With ``defer_residual`` the block returns ``(hidden_states, ff_output,
-    gate_mlp)`` without adding the gated feed-forward output, and folds the
-    ``pending_residual`` it receives, ``(ff_output, gate_mlp)`` of the block
-    before, into its ``norm1``. Each residual add then shares a single pass
-    over the row with the RMSNorm and modulation that read it. Without
-    ``defer_residual`` this is the upstream block.
+    With ``defer_residual`` it returns ``(hidden_states, ff_output, gate_mlp)``
+    without the gated feed-forward add, and folds the ``pending_residual`` of the
+    block before into its ``norm1``. Otherwise it is the upstream block.
     """
 
     def forward(
