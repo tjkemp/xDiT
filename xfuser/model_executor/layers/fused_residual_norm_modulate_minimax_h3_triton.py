@@ -1,37 +1,17 @@
-"""Fused gated residual + RMSNorm + AdaLN modulation for MiniMax-H3 (Triton).
+"""Fused gated residual, RMSNorm and AdaLN modulation for MiniMax-H3 (Triton).
 
-Layout / algorithm
-------------------
-Every MiniMax-H3 block boundary computes
+At every block boundary::
 
     hidden = residual + gate[gate_index] * branch
     normed = RMSNorm(hidden) * (1 + scale[mod_index]) + shift[mod_index]
 
-over ``[B, S, H]`` rows with ``H = 5376``. That is above the 1024-element
-limit up to which Inductor keeps a reduction row in registers, so its fused
-kernel loops over the row twice -- once for the sum of squares, once to
-normalise -- and reads the inputs twice. Here one program owns one row in
-registers and reads each input once. ``gate``, ``shift`` and ``scale`` are row
-views into the per-block modulation table (one row per (timestep, modality)),
-gathered per token; the table is small enough to stay in cache.
+One program keeps a whole row in registers and reads each input once; for rows
+as wide as MiniMax-H3's, Inductor's kernel reads them twice. Everything is
+computed in fp32 and rounded only at the stores. Without ``branch`` the op only
+normalises and modulates.
 
-Without ``branch`` (the first block) the op only normalises and modulates.
-
-Numerics
---------
-Everything is computed in fp32 and rounded only where ``hidden`` and
-``normed`` are stored. That is also what Inductor generates for the compiled
-reference: inside a fused kernel it computes bf16 intermediates in fp32, and
-even an explicit ``.to(torch.bfloat16)`` does not round unless
-``emulate_precision_casts`` is set. Eager PyTorch rounds after every op, so
-against eager the outputs differ by a few bf16 ULPs of the intermediates.
-
-Envelope / fallback
--------------------
-bf16, contiguous ``[B, S, H]`` activations; affine ``nn.RMSNorm(H)`` with a
-bf16 weight; ``[rows, H]`` modulation views with unit column stride and
-``[S]`` integer indices. Anything else, including a grad-enabled call, runs
-:func:`_reference`.
+Inputs outside the envelope checked by :func:`_fused_supported`, or a
+grad-enabled call, run :func:`_reference`.
 """
 
 from typing import Optional
