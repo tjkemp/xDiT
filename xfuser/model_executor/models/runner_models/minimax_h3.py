@@ -379,9 +379,7 @@ def _device_constant(values: tuple, device: torch.device, shape: tuple) -> torch
 def _patch_minimax_h3_decode_constants() -> None:
     """Build the decode steps' normalization constants on the device once.
 
-    diffusers builds them from Python lists on every request. Each one is a blocking
-    host-to-device copy that waits for the queued denoise or decode work to drain,
-    leaving the GPU idle until the host has queued work again.
+    diffusers builds them from Python lists on every request, each a blocking host-to-device copy.
     """
     from diffusers.modular_pipelines.minimax_h3 import decoders
 
