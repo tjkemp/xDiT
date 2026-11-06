@@ -315,39 +315,54 @@ def _ulysses_head_chunk_sizes(heads_per_rank):
     return [size + (chunk < larger) for chunk in range(chunks)]
 
 
-def _overlapped_ulysses_attention(attention_function, query, key, value, chunk_sizes, drop_kv_padding, **kwargs):
+def _ulysses_send_buffers(query, key, value, world_size, chunk_sizes):
+    """Pack ``[batch, heads, seq, dim]`` q/k/v for the chunked exchange.
+
+    Returns, per head chunk, q, k and v each as ``[rank, batch, seq, chunk heads, dim]``,
+    which arrives as BSHD for batch 1.
+    """
+    batch, heads, seq_len, head_dim = query.shape
+    bshd = [
+        t.transpose(1, 2).reshape(batch, seq_len, world_size, heads // world_size, head_dim)
+        for t in (query, key, value)
+    ]
+    return [
+        [chunk.permute(2, 0, 1, 3, 4).contiguous() for chunk in chunks]
+        for chunks in zip(*(t.split(chunk_sizes, dim=3) for t in bshd))
+    ]
+
+
+def _overlapped_ulysses_attention(attention_function, send_buffers, drop_kv_padding, **kwargs):
     """Ulysses attention over head chunks, each chunk's exchanges overlapping another chunk's attention.
 
     Every input exchange is launched up front; a chunk waits only for its own
     before attending, then launches its output exchange.
     """
-    world_size = get_ulysses_parallel_world_size()
-    batch, heads, seq_len, head_dim = query.shape
-    qkv = torch.stack([query, key, value]).view(3, batch, world_size, heads // world_size, seq_len, head_dim)
-    received = [
-        _start_ulysses_all_to_all(chunk.permute(2, 0, 1, 3, 4, 5).contiguous())
-        for chunk in qkv.split(chunk_sizes, dim=3)
-    ]
+    world_size, batch, seq_len, _, head_dim = send_buffers[0][0].shape
+    received = [[_start_ulysses_all_to_all(t) for t in chunk] for chunk in send_buffers]
     sent = []
-    for size, chunk in zip(chunk_sizes, received):
-        chunk = torch.ops._c10d_functional.wait_tensor(chunk)
+    for buffers, chunk in zip(send_buffers, received):
+        size = buffers[0].shape[3]
         chunk_query, chunk_key, chunk_value = (
-            chunk.view(world_size, 3, batch, size, seq_len, head_dim)
-            .permute(1, 2, 3, 0, 4, 5)
-            .reshape(3, batch, size, world_size * seq_len, head_dim)
-            .unbind(0)
+            torch.ops._c10d_functional.wait_tensor(t)
+            .view(world_size, batch, seq_len, size, head_dim)
+            .transpose(0, 1)
+            .reshape(batch, world_size * seq_len, size, head_dim)
+            .transpose(1, 2)
+            for t in chunk
         )
         chunk_key, chunk_value, attention_kwargs = drop_kv_padding(chunk_key, chunk_value)
         out, _ = attention_function(
             chunk_query, chunk_key, chunk_value, joint_attn_kwargs=None, attention_kwargs=attention_kwargs, **kwargs
         )
-        sent.append(_start_ulysses_all_to_all(out.permute(2, 0, 1, 3).contiguous()))
+        sent.append((size, _start_ulysses_all_to_all(out.permute(2, 0, 1, 3).contiguous())))
     outputs = [
         torch.ops._c10d_functional.wait_tensor(chunk)
         .view(world_size, seq_len, batch, size, head_dim)
         .permute(2, 0, 3, 1, 4)
-        for size, chunk in zip(chunk_sizes, sent)
+        for size, chunk in sent
     ]
+    heads = world_size * sum(size for size, _ in sent)
     return torch.cat(outputs, dim=2).reshape(batch, heads, seq_len, head_dim)
 
 
@@ -946,10 +961,7 @@ def USP(
     if chunk_sizes is not None:
         out = _overlapped_ulysses_attention(
             attention_function,
-            query,
-            key,
-            value,
-            chunk_sizes,
+            _ulysses_send_buffers(query, key, value, ulysses_world_size, chunk_sizes),
             lambda key, value: _drop_trailing_kv_padding(key, value, attention_kwargs, is_causal, hb_backend),
             dropout_p=dropout_p,
             is_causal=is_causal,
