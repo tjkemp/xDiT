@@ -335,8 +335,8 @@ def test_usp_matches_attention_over_the_real_tokens(tmp_path, mode, head_chunks)
                 assert error <= TOLERANCE, f"rank {rank}, {variant}, {case}: max error {error:.3e}"
         assert report["graph_breaks"] == {backend: 0 for backend in compile_backends}, f"rank {rank}"
         if "schedule" in report:
-            # Every chunk's input exchange is in flight before the first chunk attends, which waits only for its own.
-            assert report["schedule"] == (head_chunks, 1), f"rank {rank}"
+            # Every chunk's q, k and v exchanges are in flight before the first chunk attends, which waits only for its own.
+            assert report["schedule"] == (3 * head_chunks, 3), f"rank {rank}"
         if ring > 1:
             assert report["packed_keys_error"] is not None and "valid_kv_len must be in" in report["packed_keys_error"]
 
