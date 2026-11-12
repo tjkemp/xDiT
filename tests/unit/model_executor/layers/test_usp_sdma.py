@@ -303,6 +303,6 @@ def test_q_k_first_modules_are_reported_with_their_one_head_group(monkeypatch, r
         ("reduce-overhead", "default", 8, "reduce-overhead"),
     ],
 )
-def test_host_issued_copies_compile_without_cuda_graphs(monkeypatch, mode, transport, world, expected):
+def test_sdma_compiles_without_cuda_graphs(monkeypatch, mode, transport, world, expected):
     _ulysses_a2a(monkeypatch, transport, 2, world=world)
     assert usp_sdma.compile_mode(mode) == expected

@@ -19,10 +19,12 @@ between them, so Inductor writes it straight from the kernels producing Q/K/V; a
 can even produce each group separately (`grouped_qkv_attention`) so a group's exchange
 overlaps the projection of the next.
 
-The transport queues its copies from the host, so a CUDA graph would not replay them. The
-runner compiles the transformer without CUDA graphs (`compile_mode`); its other components
-keep theirs. The ops are also tagged cudagraph_unsafe, so a model compiled with graphs
-some other way runs them between graph partitions.
+The transport needs MoRI (xfuser/core/distributed/sdma/transport.py); without it the runner
+says what to install before loading the model. A call keeps host-side state (routes, which
+half of the result it writes), so a CUDA graph could not replay it: the ops are tagged
+cudagraph_unsafe, so a model compiled with graphs runs them between graph partitions, and
+the runner compiles the transformer without CUDA graphs (`compile_mode`); its other
+components keep theirs.
 
 The path covers Ulysses with joint tensors (front or rear), extra per-head inputs and
 grouped-query K/V, with a dense backend. Ring attention, FP8 communication, the PipeFusion
@@ -87,9 +89,9 @@ def overlap_qkv() -> bool:
 
 def compile_mode(mode: str) -> str:
     """The torch.compile mode for a component whose Ulysses attention takes this path: without
-    CUDA graphs when the transport issues its copies from the host. With graphs, Inductor runs
-    the ops between graph partitions, which costs a step more than the graphs save."""
-    if mode not in _WITHOUT_CUDAGRAPHS or not uses_sdma() or not ulysses.host_issued():
+    CUDA graphs. The SDMA ops are tagged cudagraph_unsafe, so with graphs Inductor runs them
+    between graph partitions, which costs a step more than the graphs save."""
+    if mode not in _WITHOUT_CUDAGRAPHS or not uses_sdma():
         return mode
     if get_ulysses_parallel_world_size() <= 1:
         return mode
@@ -354,12 +356,12 @@ def _group(name: str) -> dist.ProcessGroup:
     return dist.distributed_c10d._resolve_process_group(name)
 
 
-# Host-issued copies: Inductor runs these ops between CUDA graph partitions instead of capturing
-# them (where the tag exists; else a capture falls back to the default all-to-all in begin).
-_HOST_ISSUED = (torch.Tag.cudagraph_unsafe,) if hasattr(torch.Tag, "cudagraph_unsafe") else ()
+# Host-side state per call: Inductor runs these ops between CUDA graph partitions instead of
+# capturing them (where the tag exists; else a capture falls back to the default all-to-all in begin).
+_GRAPH_UNSAFE = (torch.Tag.cudagraph_unsafe,) if hasattr(torch.Tag, "cudagraph_unsafe") else ()
 
 
-@torch.library.custom_op("xfuser::sdma_ulysses_begin", mutates_args=(), tags=_HOST_ISSUED)
+@torch.library.custom_op("xfuser::sdma_ulysses_begin", mutates_args=(), tags=_GRAPH_UNSAFE)
 def _sdma_ulysses_begin(ref: torch.Tensor, spec: List[int], group_name: str, mode: str) -> torch.Tensor:
     ulysses.begin(_group(group_name), ulysses.Exchange.decode(spec, ref.dtype), rccl=mode == "packed")
     return ref.new_empty(0)
@@ -374,7 +376,7 @@ def _(ref, spec, group_name, mode):
 # the engines read it until finish has waited for the peers' outputs, and only an op that
 # uses it keeps torch.compile from recomputing it into a second buffer or reusing its memory
 # (for the next group's pack, say) once send has returned.
-@torch.library.custom_op("xfuser::sdma_ulysses_send", mutates_args=("packed",), tags=_HOST_ISSUED)
+@torch.library.custom_op("xfuser::sdma_ulysses_send", mutates_args=("packed",), tags=_GRAPH_UNSAFE)
 def _sdma_ulysses_send(
     token: torch.Tensor, packed: torch.Tensor, group: int, tensors: List[int], group_name: str
 ) -> torch.Tensor:
@@ -403,7 +405,7 @@ def _(token, x, weight, bias):
     return x.new_empty(*x.shape[:-1], weight.shape[0])
 
 
-@torch.library.custom_op("xfuser::sdma_ulysses_finish", mutates_args=(), tags=_HOST_ISSUED)
+@torch.library.custom_op("xfuser::sdma_ulysses_finish", mutates_args=(), tags=_GRAPH_UNSAFE)
 def _sdma_ulysses_finish(
     token: torch.Tensor,
     packed: List[torch.Tensor],

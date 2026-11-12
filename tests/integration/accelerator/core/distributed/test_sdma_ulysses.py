@@ -11,6 +11,15 @@ BACKEND = "AITER"
 HEAD_DIM = 64
 
 
+@pytest.fixture
+def sdma_transport():
+    """Skip where the SDMA transport can be neither loaded nor built (no MoRI)."""
+    from xfuser.core.distributed.sdma import build, transport
+
+    if not transport.available():
+        pytest.skip(build.MORI_MISSING)
+
+
 def _setup(rank, world_size, init_method, ulysses, cfg=1):
     import torch
 
@@ -164,17 +173,50 @@ def _exchange_worker(rank, world_size, init_method, cfg, rccl):
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
-def test_sdma_exchange(accelerator_ranks, world_size):
+def test_sdma_exchange(accelerator_ranks, sdma_transport, world_size):
     accelerator_ranks(_exchange_worker, world_size=world_size, timeout=600, args=(1, False))
 
 
 @pytest.mark.parametrize("world_size", [4, 8])
-def test_sdma_exchange_under_cfg_parallel(accelerator_ranks, world_size):
+def test_sdma_exchange_under_cfg_parallel(accelerator_ranks, sdma_transport, world_size):
     accelerator_ranks(_exchange_worker, world_size=world_size, timeout=600, args=(2, False))
 
 
 def test_packed_exchange_over_rccl(accelerator_ranks):
     accelerator_ranks(_exchange_worker, world_size=4, timeout=600, args=(1, True))
+
+
+def _held_result_worker(rank, world_size, init_method):
+    import torch
+    import torch.distributed as dist
+    from yunchang.globals import PROCESS_GROUP
+
+    from xfuser.core.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
+    from xfuser.core.distributed.sdma import ulysses
+
+    try:
+        device = _setup(rank, world_size, init_method, world_size)
+        group = PROCESS_GROUP.ULYSSES_PG
+        generator = torch.Generator(device=device).manual_seed(rank)
+        held = None
+        for call in range(6):
+            q, k, v = (_bhsd(generator, device, 1, 96, 5 * world_size) for _ in range(3))
+            out = ulysses.attention([q, k, v], lambda q, *rest: q * 2 + 1, group, 2, call % 2 == 1)
+            expected = q.transpose(1, 2) * 2 + 1
+            assert torch.equal(out, expected), f"call {call}"
+            # The output of the call before, kept as returned (a view of the shared result that
+            # peers write), still holds that call's values.
+            if held is not None:
+                assert torch.equal(held[0], held[1]), f"call {call - 1}, held through call {call}"
+            held = (out, expected)
+        dist.barrier()
+    finally:
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
+
+def test_a_result_held_through_the_next_call_keeps_its_values(accelerator_ranks, sdma_transport):
+    accelerator_ranks(_held_result_worker, world_size=4, timeout=600)
 
 
 def _split_send_worker(rank, world_size, init_method):
@@ -193,7 +235,7 @@ def _split_send_worker(rank, world_size, init_method):
         destroy_distributed_environment()
 
 
-def test_head_groups_sent_in_parts(accelerator_ranks):
+def test_head_groups_sent_in_parts(accelerator_ranks, sdma_transport):
     """Q and K sent before V, with one and two head groups, between calls sent whole."""
     accelerator_ranks(_split_send_worker, world_size=2, timeout=300)
 
@@ -256,7 +298,7 @@ def _qk_first_compiled_worker(rank, world_size, init_method):
         destroy_distributed_environment()
 
 
-def test_qk_first_ops_compiled_match_packed(accelerator_ranks):
+def test_qk_first_ops_compiled_match_packed(accelerator_ranks, sdma_transport):
     """The ops sending Q/K, then V projected behind the send, in one compiled graph."""
     accelerator_ranks(_qk_first_compiled_worker, world_size=2, timeout=600)
 
@@ -297,7 +339,7 @@ def _lifetime_worker(rank, world_size, init_method):
         destroy_distributed_environment()
 
 
-def test_packed_tensors_live_until_finish(accelerator_ranks):
+def test_packed_tensors_live_until_finish(accelerator_ranks, sdma_transport):
     accelerator_ranks(_lifetime_worker, world_size=2, timeout=300)
 
 
@@ -346,7 +388,7 @@ def _usp_call(fn, x, w, mode, head_groups):
         _set_config(previous)
 
 
-def test_compiled_sdma_matches_its_layout_over_rccl(accelerator_ranks):
+def test_compiled_sdma_matches_its_layout_over_rccl(accelerator_ranks, sdma_transport):
     accelerator_ranks(_compiled_worker, world_size=4, timeout=900)
 
 
@@ -358,7 +400,8 @@ def _cuda_graph_worker(rank, world_size, init_method):
     from xfuser.core.distributed.sdma import transport
     from xfuser.model_executor.layers.usp import USP
 
-    original_begin = transport.PeerGroup.begin
+    group_class = transport.PeerGroup
+    original_begin = group_class.begin
     calls = []
 
     def counted_begin(group):
@@ -368,7 +411,7 @@ def _cuda_graph_worker(rank, world_size, init_method):
     try:
         device = _setup(rank, world_size, init_method, world_size)
         torch._dynamo.config.recompile_limit = 64
-        transport.PeerGroup.begin = counted_begin
+        group_class.begin = counted_begin
 
         def layer(x, w):
             q, k, v = (torch.nn.functional.linear(x, w) * (i + 1) for i in range(3))
@@ -393,7 +436,7 @@ def _cuda_graph_worker(rank, world_size, init_method):
             torch.testing.assert_close(actual, packed, rtol=0, atol=0, msg=lambda m: f"call {call}, sdma: {m}")
         dist.barrier()
     finally:
-        transport.PeerGroup.begin = original_begin
+        group_class.begin = original_begin
         # Graphs that captured RCCL kernels keep destroying their communicator from returning.
         torch.compiler.reset()
         torch.cuda.synchronize()
@@ -401,7 +444,7 @@ def _cuda_graph_worker(rank, world_size, init_method):
         destroy_distributed_environment()
 
 
-def test_compiled_with_cuda_graphs_the_ops_run_between_graphs(accelerator_ranks):
+def test_compiled_with_cuda_graphs_the_ops_run_between_graphs(accelerator_ranks, sdma_transport):
     accelerator_ranks(_cuda_graph_worker, world_size=4, timeout=900)
 
 
@@ -464,7 +507,7 @@ def _usp_worker(rank, world_size, init_method):
         destroy_distributed_environment()
 
 
-def test_usp_on_sdma_matches_rccl(accelerator_ranks):
+def test_usp_on_sdma_matches_rccl(accelerator_ranks, sdma_transport):
     accelerator_ranks(_usp_worker, world_size=4, timeout=600)
 
 
@@ -540,7 +583,7 @@ def _grouped_qkv_worker(rank, world_size, init_method):
         destroy_distributed_environment()
 
 
-def test_grouped_qkv_projection_matches_the_plain_path(accelerator_ranks):
+def test_grouped_qkv_projection_matches_the_plain_path(accelerator_ranks, sdma_transport):
     accelerator_ranks(_grouped_qkv_worker, world_size=4, timeout=900)
 
 
@@ -580,5 +623,5 @@ def _lost_flag_worker(rank, world_size, init_method):
         destroy_distributed_environment()
 
 
-def test_lost_flag_is_reported_by_the_rank_that_waited(accelerator_ranks):
+def test_lost_flag_is_reported_by_the_rank_that_waited(accelerator_ranks, sdma_transport):
     accelerator_ranks(_lost_flag_worker, world_size=2, timeout=300)

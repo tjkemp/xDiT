@@ -95,8 +95,8 @@ def test_marking_a_component_twice_leaves_one_marker():
 
 
 def test_sdma_ulysses_drops_cuda_graphs_for_the_transformer_only(monkeypatch):
-    """The SDMA copies are queued from the host: the transformer compiles without CUDA graphs,
-    the other components keep them."""
+    """The SDMA ops cannot be captured: the transformer compiles without CUDA graphs, the other
+    components keep them."""
     from xfuser.config.ulysses_a2a import UlyssesA2AConfig
     from xfuser.core.distributed import runtime_state
     from xfuser.model_executor.layers import usp_sdma

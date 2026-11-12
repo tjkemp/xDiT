@@ -123,4 +123,8 @@ def _processor_worker(rank, world_size, init_method, backend):
 def test_sdma_processor_sends_qk_first_and_matches_packed(accelerator_ranks, backend):
     """Wan self-attention through its SDMA processor: Q/K sent before V, eager, compiled and
     captured, with any head-group setting; unsupported calls keep the usual path."""
+    from xfuser.core.distributed.sdma import build, transport
+
+    if not transport.available():
+        pytest.skip(build.MORI_MISSING)
     accelerator_ranks(_processor_worker, world_size=2, timeout=900, args=(backend,))

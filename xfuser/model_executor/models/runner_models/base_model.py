@@ -59,6 +59,7 @@ from xfuser.core.distributed import (
 )
 from xfuser.core.attention import registry as attention_registry
 from xfuser.core.attention.spec import AttentionBackendType, Sparsity
+from xfuser.core.distributed.sdma import transport as sdma_transport
 from xfuser.core.distributed.fp8_comms import setup_fp8_comms, validate_fp8_comms_config
 from xfuser.core.distributed.attention_schedule import (
     AttentionSchedule,
@@ -491,6 +492,9 @@ class xFuserModel(abc.ABC):
 
         self.loader.preflight(world_size=get_world_group().world_size)
         self.engine_config, _ = self.config.create_config()
+        # --ulysses_a2a sdma needs MoRI: without it, say what to install before loading the model.
+        if getattr(self.config, "ulysses_a2a", "default") == "sdma" and self.config.ulysses_degree > 1:
+            sdma_transport.check_available()
         # The runner applies these optimizations after loading, when its
         # model-specific managers can select the correct implementation.
         # Deferring prevents legacy pipeline wrappers from wrapping the same

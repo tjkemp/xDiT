@@ -294,8 +294,8 @@ The exchange covers joint text in front of or behind the sequence,
 grouped-query K/V and extra per-head inputs. Calls it does not cover stay on
 the default all-to-all with a warning: ring attention, FP8 communication, PipeFusion KV cache,
 head balancing, sparse backends, attention masks, and a trailing sequence-parallel
-pad behind rear joint tensors. The copies are issued from the host, so a
-captured CUDA graph would not replay them: runners compile the transformer
+pad behind rear joint tensors. A call keeps host-side state, so a captured
+CUDA graph would not replay it: runners compile the transformer
 without CUDA graphs while the path is selected, and the other components, such
 as the VAE, keep theirs. The `--ulysses_sdma_*` options need `--ulysses_a2a sdma`, and `--ulysses_a2a sdma`
 excludes `--attention_a2a`.
@@ -307,11 +307,22 @@ all-to-all, while the SDMA output wait sits inside a custom op it cannot
 reorder around. For Wan, `--ulysses_sdma_overlap_qkv` hides the input exchange
 behind the V projection instead.
 
-ROCm only, one node, validated on gfx942 (MI300X) and gfx950 (MI350X/MI355X). Settings:
+ROCm only, one node, validated on gfx942 (MI300X) and gfx950 (MI350X/MI355X).
+The copies go through SDMA queues of [MoRI](https://github.com/ROCm/mori)'s
+anvil layer, posted by a kernel on the stream; peers write the attention output
+straight into its final layout with 2D copies. `--ulysses_a2a sdma` therefore
+needs MoRI: the installed `mori` package (`pip install git+https://github.com/ROCm/mori`),
+or a source build named by `XDIT_MORI_INCLUDE` (its `include` and
+`3rdparty/spdlog/include`, `:`-separated) and `XDIT_MORI_LIB_DIR` (the
+directory of `libmori_application.so`). Without it the run stops before the
+model is compiled, saying what to install. MoRI must link the libdrm that ROCm's
+runtime uses (on TheRock builds, `rocm_sysdeps`); otherwise creating its queues
+fails once PyTorch has initialized the GPU (`AMDKFD_IOC_ACQUIRE_VM failed`).
+Buffers are shared with HIP IPC, so the kernel needs no PCI P2PDMA support. Settings:
 
 - `XDIT_SDMA_LIB`: a prebuilt transport library (see
   `python xfuser/core/distributed/sdma/build.py --help`); by default
-  `transport.hip` is built with `hipcc` on first use.
+  `transport.hip` is built against MoRI with `hipcc` on first use.
 - `XDIT_SDMA_WAIT_S` (default 30): how long a flag wait may take. A wait that
   runs out holds the stream, so nothing runs on data that never came, and
   aborts the process with a log of what is missing.
