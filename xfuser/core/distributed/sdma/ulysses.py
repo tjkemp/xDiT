@@ -1,61 +1,43 @@
 """Ulysses attention with its all-to-alls on the SDMA engines, pipelined over head groups.
 
-Ulysses sends each rank's Q/K/V for head block p to rank p, which then attends over
-the whole sequence for its heads and sends each rank's rows back. This does both
-exchanges over the SDMA transport (transport.py) and splits each rank's heads into head groups: group g's attention starts once group g's tensors have landed, while
-later groups are still moving, and its output is pushed back as soon as it is done,
-while later groups attend.
+Ulysses sends each rank's Q/K/V for head block p to rank p, which then attends over the whole
+sequence for its heads and sends each rank's rows back. This does both exchanges with
+all-to-alls on the copy engines (transport.py, MoRI's `All2allSdma`) and splits each rank's
+heads into head groups: group g's all-to-all starts as soon as the group is packed, its
+attention once its data has landed, while later groups are still moving, and its output goes
+back as soon as it is done, while later groups attend. With `rccl` (and while a CUDA graph is
+captured) the same calls run their all-to-alls with RCCL instead.
 
-What one call exchanges is an `Exchange`: tensors with their own row counts and head
-counts (Q first). That covers joint-text attention (Q carries the joint rows), K/V
-with fewer heads (grouped-query attention), and extra per-head tensors that ride
-with Q. Head groups split the heads in units that keep every tensor's heads whole.
+What one call exchanges is an `Exchange`: tensors with their own row counts and head counts (Q
+first). That covers joint-text attention (Q carries the joint rows), K/V with fewer heads
+(grouped-query attention), and extra per-head tensors that ride with Q. Head groups split the
+heads in units that keep every tensor's heads whole.
 
 A call is `begin`, then `send` once per head group with that group's packed tensor
-(`pack_group`), then `finish`, which attends group by group and returns the output.
-The steps are separate so the packing, or even the projection that produces a group,
-can run in between (and be fused there by torch.compile).
+(`pack_group`), or in parts (the next tensors in order, e.g. Q/K before V is projected), then
+`finish`, which attends group by group and returns the output. The steps are separate so the
+packing, or even the projection that produces a group, can run in between (and be fused there
+by torch.compile).
 
-Layouts, for P ranks, batch b, head dim d; tensor t has s_t rows on this rank and
-h_tg heads in group g:
+Layouts, for P ranks, batch b, head dim d; tensor t has s_t rows on this rank and h_tg heads in
+group g:
 
-- packed group g (this rank's): [P][t][b][s_t][h_tg][d], so the rows for each peer
-  are one contiguous run.
-- inbox (shared), group g, tensor t: [b][R_t][h_tg][d] with R_t = P * s_t plus rows
-  reserved for this rank's own joint K/V. Rank r's block lands at its row offset, so
-  each tensor is bshd over the whole sequence, which is the layout attention kernels
-  read: nothing is unpacked before attention.
-- attention output of group g: bshd [b][P * s_q][h_qg][d]: the rows rank p gets back
-  are one contiguous [s_q, h_qg, d] block per batch item.
-- result (shared): [2][b][s_q][P][H_q][d]. Each peer writes its rows of group g straight
-  into this rank's result, one 2D copy per batch item at (rank, head offset of g), so
-  nothing is unpacked: `finish` returns a view of the result, [b, s_q, H, d], which the
-  output projection reads as [b, s_q, H * d]. Calls alternate between its two halves, so a
-  result stays valid until the call after next (see below).
+- packed part (this rank's): [P][t][b][s_t][h_tg][d] for the part's tensors, so the rows for
+  each peer are one contiguous chunk: one all-to-all per part.
+- received part: the same, from every rank; each tensor is gathered into bshd over the whole
+  sequence, [b][P * s_t][h_tg][d], with this rank's reserved rows (such as joint-text K/V that
+  every rank holds) in front of or behind it.
+- attention output of group g: bshd [b][P * s_q][h_qg][d], sent back as [P][b][s_q][h_qg][d]
+  and gathered into the [b, s_q, H, d] output, which the output projection reads as
+  [b, s_q, H * d].
 
-Each send is a transport route: the copies to every peer, described as (inbox, offset)
-pairs. Group g's input signals on channel g, sent with its last part (the transport's
-ordering contract covers the earlier parts), and its output on channel MAX_HEAD_GROUPS + g.
-
-Ordering needs no barrier after the first call: each rank pushes a call's data only
-once its stream has received every peer's output of its previous call, and a peer
-sends that output only after its attention, which reads its inbox, is done, and
-after this rank's earlier pushes into it have landed. So the inboxes and the signals
-(consumed by the waits) are free whenever they are written. That holds as long as
-every Ulysses attention of the group goes through this module, and because a channel
-always means the same thing: an input channel is never an output channel. For the same
-reason a packed tensor is free to reuse once `finish` has returned (the call holds it
-until then: under torch.compile its producer's buffer may be freed as soon as `send`
-returns), and an attention output is held until the next call.
-
-A result of call N is overwritten in call N + 2: by this rank's own rows, behind it on the
-stream, and by a peer's only after its attention of call N + 2, which needs this rank's input of
-N + 2, which this rank sends after everything it queued before. So whatever reads result N
-before this rank's call N + 2 (the output projection, and a consumer one layer later) is done
-first; a result kept longer must be copied.
+A received part is a view of the all-to-all's buffer until that buffer's next use, the same part
+of the next call; a peer writes it only after it has received this rank's output of this call,
+which this rank sends after the group's attention has read the part. A packed part is read by the
+copy engines until `finish` has waited for it, so the call holds it until then (under
+torch.compile its producer's buffer may be freed as soon as `send` returns).
 """
 
-import functools
 import math
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -70,7 +52,7 @@ from xfuser.core.distributed.sdma import transport
 # [b, h_q, rows_q, d].
 Attend = Callable[..., torch.Tensor]
 
-# Head groups at most: each has an input and an output channel, fixed across calls.
+# Head groups at most.
 MAX_HEAD_GROUPS = 16
 
 
@@ -95,20 +77,13 @@ def encode(world, batch, head_dim, rows, heads, reserved, head_groups) -> List[i
     return out
 
 
-def _prefix(sizes):
-    out = [0]
-    for size in sizes:
-        out.append(out[-1] + size)
-    return out
-
-
 @dataclass(frozen=True)
 class Exchange:
     """The tensors one Ulysses call exchanges, and how they are split into head groups.
 
     `rows[t]` is tensor t's rows on this rank and `heads[t]` its heads per rank (Q is
-    tensor 0). `reserved[t]` is (rows before, rows after) kept in tensor t's inbox for
-    this rank's own rows, such as the joint-text K/V that every rank holds.
+    tensor 0). `reserved[t]` is (rows before, rows after) of this rank's own
+    rows put around tensor t's gathered sequence, such as the joint-text K/V that every rank holds.
     """
 
     world: int
@@ -158,24 +133,9 @@ class Exchange:
     def head_offset(self, g: int, t: int) -> int:
         return sum(self.sizes[i][t] for i in range(g))
 
-    def inbox_rows(self, t: int) -> int:
-        return self.world * self.rows[t] + sum(self.reserved[t])
-
     def piece_elems(self, g: int, t: int) -> int:
         """Elements of tensor t's [b, s_t, h_tg, d] piece for one peer in group g."""
         return self.batch * self.rows[t] * self.sizes[g][t] * self.head_dim
-
-    def peer_elems(self, g: int) -> int:
-        return sum(self.piece_elems(g, t) for t in range(self.tensors))
-
-    def inbox_elems(self, g: int, t: int) -> int:
-        return self.batch * self.inbox_rows(t) * self.sizes[g][t] * self.head_dim
-
-    @functools.cached_property
-    def inbox_offsets(self) -> List[List[int]]:
-        """Element offset of (group, tensor) in the inbox."""
-        flat = _prefix([self.inbox_elems(g, t) for g in range(self.groups) for t in range(self.tensors)])
-        return [[flat[g * self.tensors + t] for t in range(self.tensors)] for g in range(self.groups)]
 
 
 _exchanges: Dict[tuple, Exchange] = {}
@@ -221,48 +181,40 @@ def pack_group(pieces: Sequence[torch.Tensor]) -> torch.Tensor:
     return out
 
 
+class _Rccl:
+    """transport.Group's start/wait over RCCL: the all-to-all runs at `start`."""
+
+    def __init__(self, process_group: dist.ProcessGroup):
+        self.process_group = process_group
+        self.received: Dict[tuple, torch.Tensor] = {}
+
+    def start(self, key: tuple, x: torch.Tensor) -> None:
+        out = self.received[key] = torch.empty_like(x)
+        dist.all_to_all_single(out, x, group=self.process_group)
+
+    def wait(self, key: tuple, like: torch.Tensor) -> torch.Tensor:
+        return self.received.pop(key)
+
+
 class _Call:
     """One open call on a Ulysses group, from `begin` to `finish`."""
 
-    def __init__(self, exchange, call: Optional[transport.Call]):
-        # `call` is the transport's, or None over RCCL.
-        self.exchange, self.call, self.rccl = exchange, call, call is None
-        # The packed tensors sent, held until `finish` returns: the transport reads them until
-        # every peer has the data, which this rank knows only once the peers' outputs are back.
-        self.packed: List[torch.Tensor] = []
+    def __init__(self, exchange: Exchange, a2a):
+        self.exchange, self.a2a = exchange, a2a
+        # Per head group, its parts sent: (tensors, packed). The packed tensors are held until
+        # `finish` has waited for them.
+        self.parts: List[List[Tuple[Tuple[int, ...], torch.Tensor]]] = [[] for _ in range(exchange.groups)]
         self.sent = 0  # head groups sent completely
         self.next_tensor = 0  # the first tensor of the current group not sent yet
-        # Over RCCL: the current group's parts, joined per peer once the group is complete.
-        self.parts: List[torch.Tensor] = []
-        self.groups: List[torch.Tensor] = []
 
 
-class _State:
-    """Per Ulysses group: the open call and the attention outputs held for one call."""
-
-    def __init__(self):
-        self.open: Optional[_Call] = None
-        self.held: List[torch.Tensor] = []
-        # Which half of the result the next call writes.
-        self.half = 0
-
-
-# Keyed by the group's ranks, as transport.group_for shares its buffers. A call that runs over
-# RCCL never creates the transport: under CUDA graph trees its first allocations would land in
-# the graph pool and outlive the graph.
-_states: Dict[tuple, _State] = {}
-_state_keys: Dict[dist.ProcessGroup, tuple] = {}
+# Open calls, keyed by the group's ranks.
+_open: Dict[tuple, Optional[_Call]] = {}
 _side_streams: Dict[torch.device, List[torch.cuda.Stream]] = {}
 
 
-def _state(process_group: dist.ProcessGroup) -> _State:
-    key = _state_keys.get(process_group)
-    if key is None:
-        key = _state_keys[process_group] = tuple(dist.get_process_group_ranks(process_group))
-    state = _states.get(key)
-    if state is None:
-        state = _states[key] = _State()
-    return state
+def _key(process_group: dist.ProcessGroup) -> tuple:
+    return tuple(dist.get_process_group_ranks(process_group))
 
 
 def _streams(device: torch.device, count: int) -> List[torch.cuda.Stream]:
@@ -273,149 +225,68 @@ def _streams(device: torch.device, count: int) -> List[torch.cuda.Stream]:
     return streams
 
 
-def _buffers(g: transport.PeerGroup, ex: Exchange):
-    """The inbox, the double result and the element size."""
-    elt = torch.empty((), dtype=ex.dtype).element_size()
-    inbox = g.buffer(
-        "ulysses_inbox", ex.inbox_offsets[-1][-1] * elt + ex.inbox_elems(ex.groups - 1, ex.tensors - 1) * elt
-    )
-    return inbox, g.buffer("ulysses_result", 2 * _result_elems(ex) * elt), elt
-
-
-def _result_elems(ex: Exchange) -> int:
-    return ex.batch * ex.rows[0] * ex.world * ex.heads[0] * ex.head_dim
-
-
-def _result(buf, ex: Exchange, half: int, elt: int) -> torch.Tensor:
-    """Half `half` of the result, [b, s_q, P, H_q, d]."""
-    n = _result_elems(ex)
-    start = half * n * elt
-    view = buf.local[start : start + n * elt].view(ex.dtype)
-    return view.view(ex.batch, ex.rows[0], ex.world, ex.heads[0], ex.head_dim)
-
-
-def _in_copies(g, ex, gi, tensors, inbox, elt):
-    """Per peer, the copies of group gi's `tensors` from their packed tensor into the peer's inbox."""
-    r, b, d = g.rank, ex.batch, ex.head_dim
-    offsets = ex.inbox_offsets[gi]
-    # The packed tensor holds each peer's pieces of `tensors` in turn.
-    peer_elems = sum(ex.piece_elems(gi, t) for t in tensors)
-    copies = []
-    for p in g.peers:
-        mine, start = [], 0
-        for t in tensors:
-            h, s, R = ex.sizes[gi][t], ex.rows[t], ex.inbox_rows(t)
-            block = s * h * d
-            before = ex.reserved[t][0]
-            for bi in range(b):
-                src = (p * peer_elems + start + bi * block) * elt
-                mine.append((src, inbox, (offsets[t] + (bi * R + before + r * s) * h * d) * elt, block * elt))
-            start += ex.piece_elems(gi, t)
-        copies.append(mine)
-    return copies
-
-
-def _out_copies(g, ex, gi, result, half, elt):
-    """Per peer, 2D copies of its rows of group gi's attention output straight into half `half` of
-    its result: per batch item, s_q rows of h_qg * d elements at (row 0, this rank, head offset)."""
-    P, r, b, d = g.world, g.rank, ex.batch, ex.head_dim
-    h, s, H = ex.sizes[gi][0], ex.rows[0], ex.heads[0]
-    width = h * d * elt
-    base = half * _result_elems(ex) + (r * H + ex.head_offset(gi, 0)) * d
-    return [
-        [
-            (
-                ((bi * P * s + p * s) * h * d) * elt,
-                result,
-                (base + bi * s * P * H * d) * elt,
-                width,
-                s,
-                width,
-                P * H * d * elt,
-            )
-            for bi in range(b)
-        ]
-        for p in g.peers
-    ]
-
-
 def begin(process_group: dist.ProcessGroup, exchange: Exchange, rccl: bool = False) -> None:
-    """Open a call on `process_group`. With `rccl`, or while a CUDA graph is being captured (a
-    replay would not redo the call's host-side bookkeeping, such as which half of the result it
-    writes), the call exchanges the same packed tensors with RCCL."""
-    state = _state(process_group)
-    if state.open is not None:
+    """Open a call on `process_group`. With `rccl`, or while a CUDA graph is being captured (MoRI's
+    waits block the host, which a capture does not allow), its all-to-alls run with RCCL."""
+    key = _key(process_group)
+    if _open.get(key) is not None:
         raise RuntimeError("an SDMA Ulysses call is already open on this group")
     world = dist.get_world_size(process_group)
     if exchange.world != world:
         raise ValueError(f"exchange for {exchange.world} ranks on a group of {world}")
     if rccl or torch.cuda.is_current_stream_capturing():
-        state.open = _Call(exchange, None)
-        return
-    state.open = _Call(exchange, transport.group_for(process_group).begin())
+        a2a = _Rccl(process_group)
+    else:
+        a2a = transport.group_for(process_group)
+    _open[key] = _Call(exchange, a2a)
 
 
 def send(
     process_group: dist.ProcessGroup, gi: int, packed: torch.Tensor, tensors: Optional[Sequence[int]] = None
 ) -> None:
-    """Push head group `gi`'s packed tensor (`pack_group`) once the stream has produced it.
+    """Start the all-to-all of head group `gi`'s packed tensor (`pack_group`) once the stream has
+    produced it.
 
-    `tensors` sends only those of the group's tensors, the next ones in order (by default all
-    that are left): a model can send Q and K as soon as they exist and V after it is projected.
-    Only the send that completes the group sets its flags; the engines keep the group's parts in
-    order, so the flag still lands after all of them.
+    `tensors` sends only those of the group's tensors, the next ones in order (by default all that
+    are left): a model can send Q and K as soon as they exist and V after it is projected.
     """
-    state = _state(process_group)
-    c = state.open
+    c = _open.get(_key(process_group))
     if c is None or gi != c.sent:
         raise RuntimeError(f"SDMA Ulysses send of group {gi} out of order")
     ex = c.exchange
     tensors = tuple(range(c.next_tensor, ex.tensors)) if tensors is None else tuple(tensors)
     if not tensors or tensors != tuple(range(c.next_tensor, c.next_tensor + len(tensors))) or tensors[-1] >= ex.tensors:
         raise ValueError(f"group {gi}: send its tensors in order from {c.next_tensor}; got {tensors}")
+    try:
+        c.a2a.start(("in", gi, tensors[0]), packed)
+    except BaseException:
+        # The call cannot complete; later calls must still be able to open.
+        _open[_key(process_group)] = None
+        raise
+    c.parts[gi].append((tensors, packed))
     last = tensors[-1] == ex.tensors - 1
-    if c.rccl:
-        c.parts.append(packed)
-        if last:
-            parts = [part.view(ex.world, -1) for part in c.parts]
-            c.groups.append(parts[0].reshape(-1) if len(parts) == 1 else torch.cat(parts, dim=1).reshape(-1))
-            c.parts = []
-    else:
-        g = transport.group_for(process_group)
-        inbox, _, elt = _buffers(g, ex)
-        route = g.route(
-            (ex, "in", gi, tensors), lambda: _in_copies(g, ex, gi, tensors, inbox, elt), gi if last else None
-        )
-        try:
-            c.call.send(route, packed, torch.cuda.current_stream())
-        except BaseException:
-            # The call cannot complete; later calls must still be able to open.
-            state.open = None
-            raise
-        _copy_own(g, ex, gi, tensors, packed, inbox)
-    c.packed.append(packed)
     c.next_tensor = 0 if last else tensors[-1] + 1
     c.sent += last
 
 
-def _copy_own(g, ex, gi, tensors, packed, inbox):
-    """This rank's own blocks of a send, on the stream."""
-    P, r, b, d = g.world, g.rank, ex.batch, ex.head_dim
-    mine = packed.view(P, -1)[r]
-    offsets = ex.inbox_offsets[gi]
-    start = 0
-    for t in tensors:
-        h, s, R, before = ex.sizes[gi][t], ex.rows[t], ex.inbox_rows(t), ex.reserved[t][0]
-        n = ex.piece_elems(gi, t)
-        _inbox(inbox, offsets[t], b, R, h, d, ex.dtype)[:, before + r * s : before + (r + 1) * s].copy_(
-            mine[start : start + n].view(b, s, h, d)
-        )
-        start += n
-
-
-def _inbox(buf, offset, b, rows, h, d, dtype):
-    elt = torch.empty((), dtype=dtype).element_size()
-    return buf.local[offset * elt : (offset + b * rows * h * d) * elt].view(dtype).view(b, rows, h, d)
+def _received(c: _Call, gi: int, local) -> List[torch.Tensor]:
+    """Head group gi's tensors as [b, h, rows, d] views of bshd over the whole sequence."""
+    ex, P, b, d = c.exchange, c.exchange.world, c.exchange.batch, c.exchange.head_dim
+    views = []
+    for tensors, packed in c.parts[gi]:
+        rows = c.a2a.wait(("in", gi, tensors[0]), packed).view(P, -1)
+        start = 0
+        for t in tensors:
+            h, s = ex.sizes[gi][t], ex.rows[t]
+            n = ex.piece_elems(gi, t)
+            x = rows[:, start : start + n].view(P, b, s, h, d).permute(1, 0, 2, 3, 4).reshape(b, P * s, h, d)
+            before, after = ex.reserved[t]
+            if local is not None and local[t] is not None and before + after:
+                own = local[t][:, ex.head_offset(gi, t) : ex.head_offset(gi, t) + h].transpose(1, 2)
+                x = torch.cat([own[:, :before], x, own[:, before:]], dim=1)
+            views.append(x.transpose(1, 2))
+            start += n
+    return views
 
 
 def finish(
@@ -427,102 +298,41 @@ def finish(
     """Attend group by group and exchange the output back; returns this rank's rows for every head
     as a contiguous [b, s_q, H, d].
 
-    `local[t]`, if given, is this rank's own
-    rows for tensor t's reserved inbox rows, [b, heads[t], before + after, d], heads split by
-    group like the exchanged ones. With `concurrent`, each head group attends on a stream of its
-    own (the first at high priority), so a group whose data has landed fills the GPU while the
-    one before it drains: fewer heads per kernel leave more of its last wave idle.
+    `local[t]`, if given, is this rank's own rows for tensor t's reserved rows,
+    [b, heads[t], before + after, d], heads split by group like the exchanged ones. With
+    `concurrent`, each head group attends on a stream of its own (the first at high priority), so
+    a group whose data has landed fills the GPU while the one before it drains.
     """
-    state = _state(process_group)
-    c = state.open
+    key = _key(process_group)
+    c = _open.get(key)
     if c is None or c.sent != c.exchange.groups:
         raise RuntimeError("SDMA Ulysses finish before every group was sent")
-    state.open = None
-    if c.rccl:
-        return _finish_rccl(process_group, c.exchange, c.groups, attend, local)
-    g = transport.group_for(process_group)
-    ex, P, r, b, d, G = c.exchange, g.world, g.rank, c.exchange.batch, c.exchange.head_dim, c.exchange.groups
-    inbox, results, elt = _buffers(g, ex)
-    half, state.half = state.half, 1 - state.half
-    result = _result(results, ex, half, elt)
+    _open[key] = None
+    ex, P, b, d = c.exchange, c.exchange.world, c.exchange.batch, c.exchange.head_dim
+    s = ex.rows[0]
     stream = torch.cuda.current_stream()
     if concurrent:
         ready = torch.cuda.Event()
         ready.record(stream)
-        side = _streams(stream.device, G)
-    held = []
-    for gi in range(G):
+        side = _streams(stream.device, ex.groups)
+    back = []
+    for gi in range(ex.groups):
         group_stream = stream
         if concurrent:
             group_stream = side[gi]
             group_stream.wait_event(ready)
         with torch.cuda.stream(group_stream):
-            c.call.wait(gi, group_stream)
-            offsets = ex.inbox_offsets[gi]
-            views = []
-            for t in range(ex.tensors):
-                h = ex.sizes[gi][t]
-                x = _inbox(inbox, offsets[t], b, ex.inbox_rows(t), h, d, ex.dtype)
-                before, after = ex.reserved[t]
-                if local is not None and local[t] is not None and before + after:
-                    own = local[t][:, ex.head_offset(gi, t) : ex.head_offset(gi, t) + h].transpose(1, 2)
-                    if before:
-                        x[:, :before].copy_(own[:, :before])
-                    if after:
-                        x[:, ex.inbox_rows(t) - after :].copy_(own[:, before:])
-                views.append(x.transpose(1, 2))
-            out = attend(*views).transpose(1, 2)
-            if out.dtype != ex.dtype:
-                out = out.to(ex.dtype)
-            if not out.is_contiguous():
-                out = out.contiguous()
-            held.append(out)
-            h, s = ex.sizes[gi][0], ex.rows[0]
-            route = g.route(
-                (ex, "out", gi, half), lambda: _out_copies(g, ex, gi, results, half, elt), MAX_HEAD_GROUPS + gi
-            )
-            c.call.send(route, out, group_stream)
-            off = ex.head_offset(gi, 0)
-            result[:, :, r, off : off + h].copy_(out.view(b, P, s, h, d)[:, r])
+            out = attend(*_received(c, gi, local)).transpose(1, 2).to(ex.dtype)
+            h = ex.sizes[gi][0]
+            back.append(out.reshape(b, P, s, h, d).permute(1, 0, 2, 3, 4).contiguous())
+            c.a2a.start(("out", gi), back[gi])
     if concurrent:
-        for gi in range(G):
+        for gi in range(ex.groups):
             stream.wait_stream(side[gi])
-    # The previous call's outputs have been read by every peer's engines: each peer sent this
-    # call's data only after receiving them, and the waits above are behind that data.
-    state.held = held
-
-    for gi in range(G):
-        c.call.wait(MAX_HEAD_GROUPS + gi, stream)
-    return result.view(b, ex.rows[0], P * ex.heads[0], d)
-
-
-def _finish_rccl(process_group, ex, packed, attend, local):
-    """`finish` for a call that exchanges its packed tensors with RCCL all-to-alls."""
-    P, b, d = ex.world, ex.batch, ex.head_dim
-    s = ex.rows[0]
-    result = torch.empty(b, s, P, ex.heads[0], d, dtype=ex.dtype, device=packed[0].device)
+    result = torch.empty(b, s, P, ex.heads[0], d, dtype=ex.dtype, device=back[0].device)
     for gi in range(ex.groups):
-        got = torch.empty_like(packed[gi])
-        dist.all_to_all_single(got, packed[gi], group=process_group)
-        rows = got.view(P, -1)
-        views, start = [], 0
-        for t in range(ex.tensors):
-            h, st = ex.sizes[gi][t], ex.rows[t]
-            n = ex.piece_elems(gi, t)
-            x = rows[:, start : start + n].view(P, b, st, h, d).permute(1, 0, 2, 3, 4).reshape(b, P * st, h, d)
-            before, after = ex.reserved[t]
-            if local is not None and local[t] is not None and before + after:
-                own = local[t][:, ex.head_offset(gi, t) : ex.head_offset(gi, t) + h].transpose(1, 2)
-                x = torch.cat([own[:, :before], x, own[:, before:]], dim=1)
-            views.append(x.transpose(1, 2))
-            start += n
-        out = attend(*views).transpose(1, 2).to(ex.dtype)
-        h = ex.sizes[gi][0]
-        back = out.reshape(b, P, s, h, d).permute(1, 0, 2, 3, 4).contiguous()
-        returned = torch.empty_like(back)
-        dist.all_to_all_single(returned, back, group=process_group)
-        off = ex.head_offset(gi, 0)
-        result[:, :, :, off : off + h].copy_(returned.permute(1, 2, 0, 3, 4))
+        off, h = ex.head_offset(gi, 0), ex.sizes[gi][0]
+        result[:, :, :, off : off + h].copy_(c.a2a.wait(("out", gi), back[gi]).permute(1, 2, 0, 3, 4))
     return result.view(b, s, P * ex.heads[0], d)
 
 

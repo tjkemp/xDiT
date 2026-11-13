@@ -13,11 +13,11 @@ HEAD_DIM = 64
 
 @pytest.fixture
 def sdma_transport():
-    """Skip where the SDMA transport can be neither loaded nor built (no MoRI)."""
-    from xfuser.core.distributed.sdma import build, transport
+    """Skip where MoRI's SDMA all-to-all is not available."""
+    from xfuser.core.distributed.sdma import transport
 
     if not transport.available():
-        pytest.skip(build.MORI_MISSING)
+        pytest.skip(transport.MORI_MISSING)
 
 
 def _setup(rank, world_size, init_method, ulysses, cfg=1):
@@ -204,8 +204,7 @@ def _held_result_worker(rank, world_size, init_method):
             out = ulysses.attention([q, k, v], lambda q, *rest: q * 2 + 1, group, 2, call % 2 == 1)
             expected = q.transpose(1, 2) * 2 + 1
             assert torch.equal(out, expected), f"call {call}"
-            # The output of the call before, kept as returned (a view of the shared result that
-            # peers write), still holds that call's values.
+            # The output of the call before, kept as returned, still holds that call's values.
             if held is not None:
                 assert torch.equal(held[0], held[1]), f"call {call - 1}, held through call {call}"
             held = (out, expected)
@@ -400,18 +399,18 @@ def _cuda_graph_worker(rank, world_size, init_method):
     from xfuser.core.distributed.sdma import transport
     from xfuser.model_executor.layers.usp import USP
 
-    group_class = transport.PeerGroup
-    original_begin = group_class.begin
+    group_class = transport.Group
+    original_start = group_class.start
     calls = []
 
-    def counted_begin(group):
+    def counted_start(group, key, x):
         calls.append(1)
-        return original_begin(group)
+        return original_start(group, key, x)
 
     try:
         device = _setup(rank, world_size, init_method, world_size)
         torch._dynamo.config.recompile_limit = 64
-        group_class.begin = counted_begin
+        group_class.start = counted_start
 
         def layer(x, w):
             q, k, v = (torch.nn.functional.linear(x, w) * (i + 1) for i in range(3))
@@ -432,11 +431,11 @@ def _cuda_graph_worker(rank, world_size, init_method):
             # The SDMA ops run between the graph's partitions, on the transport, not captured.
             before = len(calls)
             actual = _usp_call(graphed, x, w, "sdma", 2).clone()
-            assert len(calls) == before + 1, f"call {call}: the SDMA transport did not run"
+            assert len(calls) > before, f"call {call}: the SDMA transport did not run"
             torch.testing.assert_close(actual, packed, rtol=0, atol=0, msg=lambda m: f"call {call}, sdma: {m}")
         dist.barrier()
     finally:
-        group_class.begin = original_begin
+        group_class.start = original_start
         # Graphs that captured RCCL kernels keep destroying their communicator from returning.
         torch.compiler.reset()
         torch.cuda.synchronize()
@@ -585,43 +584,3 @@ def _grouped_qkv_worker(rank, world_size, init_method):
 
 def test_grouped_qkv_projection_matches_the_plain_path(accelerator_ranks, sdma_transport):
     accelerator_ranks(_grouped_qkv_worker, world_size=4, timeout=900)
-
-
-def _lost_flag_worker(rank, world_size, init_method):
-    import os
-
-    import torch.distributed as dist
-    from yunchang.globals import PROCESS_GROUP
-
-    os.environ["XDIT_SDMA_WAIT_S"] = "2"
-    from xfuser.core.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
-    from xfuser.core.distributed.sdma import transport
-
-    # Before the transport's first use: abort mode would start a watchdog that ends the process.
-    transport.set_on_timeout("raise")
-
-    case = (1, 64, 64, 5, 5, 0, 0, True, 1, False)
-    try:
-        _setup(rank, world_size, init_method, world_size)
-        exchange_mismatches(PROCESS_GROUP.ULYSSES_PG, case, 0)
-        dist.barrier()
-        # In rank 0's next call, its output push (the call's second issue) to its first peer,
-        # rank 1, loses its flag: rank 1's wait for the outputs gives up, and no one waits on it.
-        if rank == 0:
-            transport.debug_drop_flag(1, 1, 0)
-        exchange_mismatches(PROCESS_GROUP.ULYSSES_PG, case, 1)
-        try:
-            transport.raise_if_waits_gave_up()
-            message = ""
-        except RuntimeError as error:
-            message = str(error)
-        every = [None] * world_size
-        dist.all_gather_object(every, message)
-        assert every[0] == "" and "wait 1, flag words [0] never set" in every[1], every
-    finally:
-        destroy_model_parallel()
-        destroy_distributed_environment()
-
-
-def test_lost_flag_is_reported_by_the_rank_that_waited(accelerator_ranks, sdma_transport):
-    accelerator_ranks(_lost_flag_worker, world_size=2, timeout=300)

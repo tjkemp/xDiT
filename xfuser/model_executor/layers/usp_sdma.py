@@ -19,12 +19,11 @@ between them, so Inductor writes it straight from the kernels producing Q/K/V; a
 can even produce each group separately (`grouped_qkv_attention`) so a group's exchange
 overlaps the projection of the next.
 
-The transport needs MoRI (xfuser/core/distributed/sdma/transport.py); without it the runner
-says what to install before loading the model. A call keeps host-side state (routes, which
-half of the result it writes), so a CUDA graph could not replay it: the ops are tagged
-cudagraph_unsafe, so a model compiled with graphs runs them between graph partitions, and
-the runner compiles the transformer without CUDA graphs (`compile_mode`); its other
-components keep theirs.
+The all-to-alls are MoRI's (xfuser/core/distributed/sdma/transport.py); without MoRI the
+runner says what to install before loading the model. MoRI's waits block the host, so a CUDA
+graph could not capture them: the ops are tagged cudagraph_unsafe, so a model compiled with
+graphs runs them between graph partitions, and the runner compiles the transformer without
+CUDA graphs (`compile_mode`); its other components keep theirs.
 
 The path covers Ulysses with joint tensors (front or rear), extra per-head inputs and
 grouped-query K/V, with a dense backend. Ring attention, FP8 communication, the PipeFusion
@@ -356,7 +355,7 @@ def _group(name: str) -> dist.ProcessGroup:
     return dist.distributed_c10d._resolve_process_group(name)
 
 
-# Host-side state per call: Inductor runs these ops between CUDA graph partitions instead of
+# Host-blocking waits: Inductor runs these ops between CUDA graph partitions instead of
 # capturing them (where the tag exists; else a capture falls back to the default all-to-all in begin).
 _GRAPH_UNSAFE = (torch.Tag.cudagraph_unsafe,) if hasattr(torch.Tag, "cudagraph_unsafe") else ()
 
@@ -373,7 +372,7 @@ def _(ref, spec, group_name, mode):
 
 
 # `packed` is declared mutated, and handed to finish as well, although neither op writes it:
-# the engines read it until finish has waited for the peers' outputs, and only an op that
+# the engines read it until finish has waited for its all-to-all, and only an op that
 # uses it keeps torch.compile from recomputing it into a second buffer or reusing its memory
 # (for the next group's pack, say) once send has returned.
 @torch.library.custom_op("xfuser::sdma_ulysses_send", mutates_args=("packed",), tags=_GRAPH_UNSAFE)

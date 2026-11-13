@@ -48,14 +48,6 @@ def test_exchange_round_trips_through_integers():
     assert Exchange.decode(ex.encode(), torch.bfloat16) is ex
 
 
-def test_inbox_keeps_reserved_rows_beside_every_rank_block():
-    ex = Exchange.make(4, 1, 2, torch.bfloat16, [5, 3, 3], [2, 2, 2], [(0, 0), (1, 0), (0, 2)], 2)
-    assert [ex.inbox_rows(t) for t in range(3)] == [20, 13, 14]
-    # Group 0's Q region, then its K region, ...: each [b, rows, h, d].
-    assert ex.inbox_offsets[0][1] == 20 * 1 * 2
-    assert ex.inbox_offsets[1][0] == (20 + 13 + 14) * 1 * 2
-
-
 def test_packed_group_holds_each_peer_s_pieces_in_turn():
     world, b, d = 2, 1, 2
     q = torch.arange(b * 4 * 3 * d, dtype=torch.float32).view(b, 3, 4, d).transpose(1, 2)  # [b, H=4, s=3, d]
