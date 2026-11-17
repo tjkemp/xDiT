@@ -398,3 +398,20 @@ def test_usp_refuses_a_declared_pad_with_joint_tensors_where_the_backend_would_k
             backend=backend,
             attention_kwargs=attention_kwargs,
         )
+
+
+@pytest.mark.parametrize(
+    ("inbox", "dtype", "head_dim", "key_heads"),
+    [
+        ("", torch.bfloat16, 128, 4),
+        ("finegrained", torch.float16, 128, 4),
+        ("finegrained", torch.bfloat16, 64, 4),
+        ("finegrained", torch.bfloat16, 128, 2),
+    ],
+)
+def test_aiter_bf16_all_to_all_falls_back_unless_enabled_and_supported(monkeypatch, inbox, dtype, head_dim, key_heads):
+    monkeypatch.setenv("XDIT_AITER_A2A_INBOX", inbox)
+    query = torch.zeros(1, 4, 8, head_dim, dtype=dtype)
+    key = torch.zeros(1, key_heads, 8, head_dim, dtype=dtype)
+
+    assert usp._aiter_bf16_input_all_to_all(query, key, key.clone()) is None

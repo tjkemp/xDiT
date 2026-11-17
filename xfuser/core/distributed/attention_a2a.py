@@ -1,6 +1,7 @@
 """Feature-gated MoRI fused all-to-all integration for Wan USP."""
 
 import inspect
+import os
 import socket
 
 import torch
@@ -51,6 +52,8 @@ _FUSED_A2A_V_PACK = "default"
 _MORI_GROUP_KEY = None
 _MORI_CPU_GROUP = None
 _OP_CACHE = {}
+# Lossless bf16 ops for the USP input all-to-all (XDIT_AITER_A2A_INBOX).
+_BF16_OP_CACHE = {}
 _INPUT_SIDE_STREAMS = {}
 _INPUT_PENDING = {}
 _INPUT_COLLECTIVE_WAITS = {}
@@ -451,8 +454,13 @@ def shutdown_attention_a2a() -> None:
 
     finalize_error = None
     try:
-        if torch.cuda.is_available() and (_OP_CACHE or _INPUT_SIDE_STREAMS or _MORI_GROUP_KEY is not None):
+        if torch.cuda.is_available() and (
+            _OP_CACHE or _BF16_OP_CACHE or _INPUT_SIDE_STREAMS or _MORI_GROUP_KEY is not None
+        ):
             torch.cuda.synchronize()
+        # Collective; releases fine-grained IPC buffers, which otherwise leak.
+        for op in (*_OP_CACHE.values(), *_BF16_OP_CACHE.values()):
+            op.close()
         if _MORI_GROUP_KEY is not None:
             import mori.shmem as ms
 
@@ -464,6 +472,7 @@ def shutdown_attention_a2a() -> None:
         _INPUT_COLLECTIVE_WAITS.clear()
         _INPUT_SIDE_STREAMS.clear()
         _OP_CACHE.clear()
+        _BF16_OP_CACHE.clear()
         if _MORI_CPU_GROUP is not None and dist.is_initialized():
             try:
                 dist.destroy_process_group(_MORI_CPU_GROUP)
@@ -883,6 +892,8 @@ def _get_ops(
                 "shutdown and reinitialize before using another shape/profile"
             )
         _init_mori(group, ranks)
+        # XDIT_AITER_A2A_INBOX=uncached|finegrained|auto selects AITER's inbox memory.
+        inbox_memory = os.environ.get("XDIT_AITER_A2A_INBOX", "").strip().lower()
         op = AttentionA2AIntraNodeOp(
             rank=rank,
             world_size=len(ranks),
@@ -895,8 +906,10 @@ def _get_ops(
             hadamard=_TRANSPORT_HADAMARD,
             valid_kv_len=valid_kv_len,
             group=_MORI_CPU_GROUP,
+            **({"inbox_memory": inbox_memory} if inbox_memory else {}),
         )
         _OP_CACHE[key] = op
+        logger.info("[ATTENTION_A2A] shape=%s inbox_memory=%s", shape, getattr(op, "inbox_memory", "uncached"))
     return op
 
 

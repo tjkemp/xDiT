@@ -231,3 +231,17 @@ def test_tier2_wait_before_later_submits_waits_again_for_them():
             fused_a2a_integration._consume_input_collective_wait(tensor)
 
     assert [call.args[0] for call in stream.wait_event.call_args_list] == [events[0], events[-1]]
+
+
+def test_shutdown_closes_every_cached_op(monkeypatch):
+    quantized, bf16 = mock.Mock(), mock.Mock()
+    monkeypatch.setitem(fused_a2a_integration._OP_CACHE, "quantized", quantized)
+    monkeypatch.setitem(fused_a2a_integration._BF16_OP_CACHE, "bf16", bf16)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    fused_a2a_integration.shutdown_attention_a2a()
+
+    quantized.close.assert_called_once_with()
+    bf16.close.assert_called_once_with()
+    assert not fused_a2a_integration._OP_CACHE
+    assert not fused_a2a_integration._BF16_OP_CACHE

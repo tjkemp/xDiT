@@ -1,5 +1,6 @@
 # This file implements USP with torch version >= '2.5.0'
 import functools
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -167,6 +168,63 @@ def _ft_c_input_all_to_all(x):
     x = _sdpa_all_to_all_single(x)
     x = x.reshape(world_size, h // world_size, b, -1, d).permute(2, 1, 0, 3, 4).reshape(b, h // world_size, -1, d)
     return x
+
+
+def _aiter_bf16_input_all_to_all(query, key, value):
+    """Ulysses input all-to-all through AITER's fused bf16 Attention A2A.
+
+    Opt-in with XDIT_AITER_A2A_INBOX=uncached|finegrained|auto (AITER's
+    ``inbox_memory``). Returns None, so the caller falls back to the default
+    all-to-all, when it is off or the shapes are unsupported.
+    """
+    mode = os.environ.get("XDIT_AITER_A2A_INBOX", "").strip().lower()
+    if (
+        not mode
+        or query.dtype != torch.bfloat16
+        or not (query.shape == key.shape == value.shape)
+        or query.shape[-1] != 128
+    ):
+        return None
+    # The checks above stay in the compiled graph; only the fused exchange breaks it.
+    return _aiter_bf16_fused_all_to_all(mode, query, key, value)
+
+
+@torch.compiler.disable
+def _aiter_bf16_fused_all_to_all(mode, query, key, value):
+    b, h, s, d = query.shape
+    from aiter.ops.flydsl.attention_a2a_intranode import AttentionA2AIntraNodeOp
+    from xfuser.core.distributed import attention_a2a
+
+    world_size = get_ulysses_parallel_world_size()
+    cache_key = (mode, s, h, query.device.index)
+    op = attention_a2a._BF16_OP_CACHE.get(cache_key)
+    if op is None:
+        group = PROCESS_GROUP.ULYSSES_PG
+        if mode != "finegrained":
+            # The MoRI symmetric heap ("uncached", and "auto" on xGMI) needs MoRI.
+            attention_a2a._init_mori(group, attention_a2a._group_ranks(group))
+            group = attention_a2a._MORI_CPU_GROUP
+        op = AttentionA2AIntraNodeOp(
+            rank=get_ulysses_parallel_rank(),
+            world_size=world_size,
+            shape=(1, s, h, d),
+            inbox_memory=mode,
+            group=group,
+        )
+        attention_a2a._BF16_OP_CACHE[cache_key] = op
+        logger.info("[AITER_BF16_A2A] shape=%s inbox_memory=%s->%s", (1, s, h, d), mode, op.inbox_memory)
+    outputs = []
+    for i in range(b):
+        op.submit_role(0, query[i : i + 1].transpose(1, 2).contiguous())
+        op.submit_role(1, key[i : i + 1].transpose(1, 2).contiguous())
+        exchanged = op.submit_role(2, value[i : i + 1].transpose(1, 2).contiguous())
+        # Outputs are [1, h / P, s * P, d], the same layout as _ft_c_input_all_to_all.
+        # They alias the op's double-buffered storage; copy when batching.
+        exchanged = tuple(x.view(1, h // world_size, s * world_size, d) for x in exchanged)
+        outputs.append(exchanged if b == 1 else tuple(x.clone() for x in exchanged))
+    if b == 1:
+        return outputs[0]
+    return tuple(torch.cat(parts) for parts in zip(*outputs))
 
 
 def _combined_qkv_all_to_all(q, k, v, *extra):
@@ -874,6 +932,12 @@ def USP(
                 fp8_comms_backend,
             )
             attention_kwargs = (attention_kwargs or {}) | attn_kwargs_update
+        elif (
+            not extra_inputs
+            and not _has_kv_cache(attn_layer)
+            and (fused := _aiter_bf16_input_all_to_all(query, key, value)) is not None
+        ):
+            query, key, value = fused
         elif combine_qkv_a2a and kv_head_repeat > 1:
             exchanged = _combined_gqa_qkv_all_to_all(query, key, value, *(tensor for _, tensor in extra_inputs))
             query, key, value = exchanged[:3]
