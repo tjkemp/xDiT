@@ -387,6 +387,9 @@ def send(
 def _copy_own(g, ex, gi, tensors, packed, inbox):
     """This rank's own blocks of a send, on the stream."""
     P, r, b, d = g.world, g.rank, ex.batch, ex.head_dim
+    if packed.dtype != ex.dtype:
+        # EXPERIMENT (TASK_004): FP8 sent as uint8 bytes; reinterpret, do not convert.
+        packed = packed.view(ex.dtype)
     mine = packed.view(P, -1)[r]
     offsets = ex.inbox_offsets[gi]
     start = 0
@@ -409,9 +412,13 @@ def finish(
     attend: Attend,
     local: Optional[Sequence[Optional[torch.Tensor]]] = None,
     concurrent: bool = False,
+    out_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Attend group by group and exchange the output back; returns this rank's rows for every head
     as a contiguous [b, s_q, H, d].
+
+    EXPERIMENT (TASK_004): with `out_scale`, the exchange's dtype is FP8: each group's output is
+    quantized with it before going back and the result is dequantized to BF16.
 
     `local[t]`, if given, is this rank's own
     rows for tensor t's reserved inbox rows, [b, heads[t], before + after, d], heads split by
@@ -456,7 +463,10 @@ def finish(
                         x[:, ex.inbox_rows(t) - after :].copy_(own[:, before:])
                 views.append(x.transpose(1, 2))
             out = attend(*views).transpose(1, 2)
-            if out.dtype != ex.dtype:
+            if out_scale is not None:
+                fp8_max = torch.finfo(ex.dtype).max
+                out = (out.float() / out_scale).clamp(-fp8_max, fp8_max).to(ex.dtype)
+            elif out.dtype != ex.dtype:
                 out = out.to(ex.dtype)
             if not out.is_contiguous():
                 out = out.contiguous()
@@ -473,11 +483,15 @@ def finish(
     state.held = held
 
     s = ex.rows[0]
-    result = torch.empty(b, s, P, ex.heads[0], d, dtype=ex.dtype, device=inbox.local.device)
+    result_dtype = torch.bfloat16 if out_scale is not None else ex.dtype
+    result = torch.empty(b, s, P, ex.heads[0], d, dtype=result_dtype, device=inbox.local.device)
     for gi in range(G):
         c.call.wait(MAX_HEAD_GROUPS + gi, stream)
         off, h = ex.head_offset(gi, 0), ex.sizes[gi][0]
-        result[:, :, :, off : off + h].copy_(_outbox(outbox, ex, gi, elt).permute(1, 2, 0, 3, 4))
+        got = _outbox(outbox, ex, gi, elt).permute(1, 2, 0, 3, 4)
+        if out_scale is not None:
+            got = (got.float() * out_scale).to(result_dtype)
+        result[:, :, :, off : off + h].copy_(got)
     c.call.end()
     return result.view(b, s, P * ex.heads[0], d)
 

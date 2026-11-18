@@ -249,9 +249,15 @@ def finish(
     attention_kwargs,
     kv_head_repeat,
     group: dist.ProcessGroup,
+    fp8_scales=None,
 ):
-    """Attend and exchange back; returns USP's [b, H, s, d] (a transposed view of [b, s, H, d])."""
+    """Attend and exchange back; returns USP's [b, H, s, d] (a transposed view of [b, s, H, d]).
+
+    EXPERIMENT (TASK_004): `fp8_scales` (q, k, v, o scale tensors) when the exchanged Q/K/V are
+    FP8: the attention gets them pre-quantized with those descales, and the output goes back in FP8.
+    """
     kwargs = attention_kwargs or {}
+    q_scale, k_scale, v_scale, o_scale = fp8_scales if fp8_scales is not None else (None,) * 4
     out = torch.ops.xfuser.sdma_ulysses_finish(
         token,
         packed,
@@ -269,6 +275,10 @@ def finish(
         int(kv_head_repeat),
         _config().group_streams,
         group.group_name,
+        q_scale,
+        k_scale,
+        v_scale,
+        o_scale,
     )
     return out.transpose(1, 2)
 
@@ -421,19 +431,27 @@ def _sdma_ulysses_finish(
     kv_head_repeat: int,
     concurrent: bool,
     group_name: str,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    o_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     exchange = ulysses.Exchange.decode(spec, token.dtype)
     joint_front = exchange.reserved[1][0]
+    attention_kwargs = {
+        "valid_kv_len": valid_kv_len,
+        "indices_k": indices_k,
+        "cu_seqlens_k": cu_seqlens_k,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    if q_descale is not None:
+        # EXPERIMENT (TASK_004): Q/K/V arrive as FP8, quantized with these scales before the send.
+        attention_kwargs.update(pre_quantized=True, q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
     attend = _attend_fn(
         AttentionBackendType[backend],
         dropout_p,
         is_causal,
-        {
-            "valid_kv_len": valid_kv_len,
-            "indices_k": indices_k,
-            "cu_seqlens_k": cu_seqlens_k,
-            "max_seqlen_k": max_seqlen_k,
-        },
+        attention_kwargs,
         # Custom ops take no list of strings: the names travel comma-joined.
         extra_names.split(",") if extra_names else [],
         joint_front,
@@ -441,7 +459,7 @@ def _sdma_ulysses_finish(
         kv_head_repeat,
     )
     local: Sequence[Optional[torch.Tensor]] = [None, joint_key, joint_value] + [None] * (exchange.tensors - 3)
-    return ulysses.finish(_group(group_name), attend, local, concurrent)
+    return ulysses.finish(_group(group_name), attend, local, concurrent, out_scale=o_scale)
 
 
 @_sdma_ulysses_finish.register_fake
@@ -462,10 +480,27 @@ def _(
     kv_head_repeat,
     concurrent,
     group_name,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    o_scale=None,
 ):
     world, batch, head_dim = spec[0], spec[1], spec[2]
     rows, heads = spec[5], spec[6]
-    return token.new_empty(batch, rows, world * heads, head_dim)
+    dtype = torch.bfloat16 if o_scale is not None else token.dtype
+    return token.new_empty(batch, rows, world * heads, head_dim, dtype=dtype)
+
+
+# EXPERIMENT (TASK_004): `x`, ordered after `token` (a copy: a custom op cannot return its input).
+# Keeps a head group's quantized Q/K/V projection after the previous group's send.
+@torch.library.custom_op("xfuser::sdma_ulysses_after", mutates_args=())
+def _sdma_ulysses_after(token: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    return x.clone()
+
+
+@_sdma_ulysses_after.register_fake
+def _(token, x):
+    return torch.empty_like(x)
 
 
 # --- SDMA attention processors -----------------------------------------------------------------
@@ -548,13 +583,30 @@ _GROUPED = "_xfuser_sdma_qkv"
 
 
 def plain_linear(module) -> bool:
-    # Quantized GEMMs replace the module; sharded (FSDP) weights are DTensors with placements.
-    return type(module) is torch.nn.Linear and not hasattr(module.weight, "placements")
+    # Quantized GEMMs replace the module; sharded (FSDP) weights are DTensors with placements;
+    # torchao (--use_fp8_gemms) keeps the module but quantizes its weight.
+    return type(module) is torch.nn.Linear and not hasattr(module.weight, "placements") and not _fp8_weight(module)
+
+
+def _fp8_weight(module) -> bool:
+    """EXPERIMENT (TASK_004): whether --use_fp8_gemms (torchao) quantized this nn.Linear's weight."""
+    from xfuser.core.utils.runner_utils import _weight_is_torchao_quantized
+
+    return type(module) is torch.nn.Linear and _weight_is_torchao_quantized(module)
 
 
 def _qkv_parts(attn):
-    """(weight, bias) of Q, K and V, or None unless they are plain nn.Linear layers of one shape."""
+    """(weight, bias) of Q, K and V, or None unless they are plain nn.Linear layers of one shape.
+
+    EXPERIMENT (TASK_004): a fused projection with a torchao FP8 weight is dequantized here;
+    `_prepare_grouped_qkv` quantizes each head group's rows again."""
     if getattr(attn, "fused_projections", False) and hasattr(attn, "to_qkv"):
+        if _fp8_weight(attn.to_qkv):
+            weight, bias = attn.to_qkv.weight.dequantize(), attn.to_qkv.bias
+            n = weight.shape[0] // 3
+            return [
+                (weight[i * n : (i + 1) * n], None if bias is None else bias[i * n : (i + 1) * n]) for i in range(3)
+            ]
         if not plain_linear(attn.to_qkv):
             return None
         weight, bias = attn.to_qkv.weight, attn.to_qkv.bias
@@ -642,6 +694,7 @@ def _prepare_grouped_qkv(attn: torch.nn.Module, world: int) -> bool:
     head_dim = parts[0][0].shape[0] // heads
     per_rank = heads // world
     sizes = ulysses.head_split((per_rank,), _config().head_groups)
+    fp8 = getattr(attn, "fused_projections", False) and hasattr(attn, "to_qkv") and _fp8_weight(attn.to_qkv)
     offset = 0
     with torch.no_grad():
         for g, (h,) in enumerate(sizes):
@@ -656,8 +709,22 @@ def _prepare_grouped_qkv(attn: torch.nn.Module, world: int) -> bool:
             )
             weight = torch.cat([w.index_select(0, rows) for w, _ in parts])
             bias = None if parts[0][1] is None else torch.cat([b.index_select(0, rows) for _, b in parts])
-            attn.register_buffer(f"{_GROUPED}_w{g}", weight, persistent=False)
-            attn.register_buffer(f"{_GROUPED}_b{g}", bias, persistent=False)
+            if fp8:
+                # EXPERIMENT (TASK_004): this group's rows as an nn.Linear quantized like the original.
+                from xfuser.core.utils.runner_utils import quantize_linear_layers_to_fp8
+
+                linear = torch.nn.Linear(
+                    weight.shape[1], weight.shape[0], bias=bias is not None, device=weight.device, dtype=weight.dtype
+                )
+                linear.weight.copy_(weight)
+                if bias is not None:
+                    linear.bias.copy_(bias)
+                holder = torch.nn.ModuleDict({"linear": linear})
+                quantize_linear_layers_to_fp8(holder)
+                attn.add_module(f"{_GROUPED}_lin{g}", holder["linear"])
+            else:
+                attn.register_buffer(f"{_GROUPED}_w{g}", weight, persistent=False)
+                attn.register_buffer(f"{_GROUPED}_b{g}", bias, persistent=False)
             offset += h
     attn._xfuser_sdma_qkv_layout = (world, sizes, head_dim)
     return True
@@ -679,11 +746,20 @@ def grouped_qkv_attention(attn, hidden_states, norm_rope, *, backend, attention_
     runtime = get_runtime_state()
     if backend is None:
         backend = runtime.attention_backend
+    # EXPERIMENT (TASK_004): FP8 Q/K/V over SDMA with --use_fp8_comms, once its scales are set
+    # (--fp8_comms_scale: fixed, no calibration). The scales are the layer's fp8_comms buffers.
+    fp8_scales = None
+    if runtime.fp8_comms is not None:
+        from xfuser.core.distributed import fp8_comms as fp8c
+
+        call = fp8c.fp8_attention_kwargs(runtime.fp8_comms, attn, None, None, None, False, backend).get("fp8_comms")
+        if call is not None:
+            fp8_scales = (call.q_scale, call.k_scale, call.v_scale, call.o_scale)
     reason = call_reason(
         backend=backend,
         ring_world_size=get_ring_parallel_world_size(),
         joint_strategy=None,
-        fp8_comms=runtime.fp8_comms,
+        fp8_comms=None if fp8_scales is not None else runtime.fp8_comms,
         has_kv_cache=False,
         head_balanced=runtime.runtime_config.use_sparseattn_head_balance,
         attention_kwargs=attention_kwargs,
@@ -695,9 +771,9 @@ def grouped_qkv_attention(attn, hidden_states, norm_rope, *, backend, attention_
     if sizes != ulysses.head_split((sum(h for (h,) in sizes),), _config().head_groups):
         return None
     per_rank = sum(h for (h,) in sizes)
-    first = getattr(attn, f"{_GROUPED}_w0")
+    dtype = fp8c._FP8_DTYPE if fp8_scales is not None else hidden_states.dtype
     token, spec, _ = begin(
-        first.new_empty(hidden_states.shape[0], 1, 1, head_dim),
+        hidden_states.new_empty(hidden_states.shape[0], 1, 1, head_dim, dtype=dtype),
         [hidden_states.shape[1]] * 3,
         [per_rank] * 3,
         [(0, 0)] * 3,
@@ -705,13 +781,24 @@ def grouped_qkv_attention(attn, hidden_states, norm_rope, *, backend, attention_
     )
     packed = []
     for g in range(len(sizes)):
-        weight, bias = getattr(attn, f"{_GROUPED}_w{g}"), getattr(attn, f"{_GROUPED}_b{g}")
-        if g == 0:
-            qkv = torch.nn.functional.linear(hidden_states, weight, bias)
+        linear = getattr(attn, f"{_GROUPED}_lin{g}", None)
+        if linear is not None:
+            # FP8 GEMMs: the group's quantized projection, after the previous group's send.
+            qkv = linear(hidden_states if g == 0 else torch.ops.xfuser.sdma_ulysses_after(token, hidden_states))
         else:
-            qkv = torch.ops.xfuser.sdma_ulysses_linear(token, hidden_states, weight, bias)
+            weight, bias = getattr(attn, f"{_GROUPED}_w{g}"), getattr(attn, f"{_GROUPED}_b{g}")
+            if g == 0:
+                qkv = torch.nn.functional.linear(hidden_states, weight, bias)
+            else:
+                qkv = torch.ops.xfuser.sdma_ulysses_linear(token, hidden_states, weight, bias)
         q, k, v = (x.unflatten(-1, (-1, head_dim)) for x in qkv.chunk(3, dim=-1))
         q, k, v = norm_rope(q, k, v)
+        if fp8_scales is not None:
+            # As fp8_comms_input_all_to_all: rotate Q/K for the backend, quantize with the layer's
+            # scales; sent as bytes (uint8 views: the pack is a cat).
+            q, k = fp8c._rotate_for_backend(q, k, backend)
+            q, k, v = (fp8c._per_tensor_quant(x, s)[0] for x, s in zip((q, k, v), fp8_scales))
+            q, k, v = (x.view(torch.uint8) for x in (q, k, v))
         packed.append(ulysses.pack_group([ulysses.pieces_from_grouped(x, world) for x in (q, k, v)]))
         token = torch.ops.xfuser.sdma_ulysses_send(token, packed[-1], g, [], group.group_name)
     return finish(
@@ -727,4 +814,5 @@ def grouped_qkv_attention(attn, hidden_states, norm_rope, *, backend, attention_
         attention_kwargs=attention_kwargs,
         kv_head_repeat=1,
         group=group,
+        fp8_scales=fp8_scales,
     )
