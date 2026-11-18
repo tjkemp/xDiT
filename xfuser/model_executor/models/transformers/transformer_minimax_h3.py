@@ -23,6 +23,7 @@ from xfuser.core.distributed import (
 from xfuser.core.attention import registry as attention_registry
 from xfuser.core.attention.spec import Sparsity
 from xfuser.core.attention.backends.vsa_h3.attention import build_h3_vsa_metadata
+from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_modules
 from xfuser.model_executor.layers.fused_qk_rope_flydsl import (
     _HAS_FLYDSL,
     flydsl_fused_qk_norm_rope,
@@ -95,6 +96,15 @@ def pad_packed_rows(
         dim=0,
     )
     return hidden_states, timestep_indices, token_tags, position_ids, pad_amount
+
+
+def minimax_h3_attn_modules(transformer) -> list[torch.nn.Module]:
+    """Return every MiniMax-H3 attention module that executes USP.
+
+    The token refiner attends over the text alone, before packing, on every rank
+    without a Ulysses collective, so only the transformer blocks qualify.
+    """
+    return [block.attn for block in transformer.transformer_blocks]
 
 
 class xFuserMiniMaxH3AttnProcessor(MiniMaxH3AttnProcessor):
@@ -356,6 +366,7 @@ class xFuserMiniMaxH3Transformer3DWrapper(MiniMaxH3Transformer3DModel):
                     use_fasth3_vsa=enable_fasth3_vsa,
                 )
             )
+        register_fp8_comms_eligible_modules(self, minimax_h3_attn_modules(self))
 
         self.register_forward_pre_hook(lambda module, args: get_runtime_state().increment_step_counter())
 
