@@ -990,6 +990,11 @@ class xFuserMiniMaxH3Model(MiniMaxH3TextEncoderMixin, xFuserModel):
         # Padding the timestep to a fixed length fixes a recompile: it avoids
         # more than one graph realizing after compile-warmup.
         transformer.forward = _wrap_compiled_forward(transformer, original_forward, compiled_forward)
+        if self._transformer_compile_mode(mode, use_hybrid) in self.CUDAGRAPH_COMPILE_MODES:
+            # Ops that run between CUDA graph partitions (the FlyDSL Ulysses all-to-all) split the
+            # forward into a chain of graphs. Without a step boundary the next step's first graph
+            # hangs off the previous step's last one, so every step records a new chain, each slower.
+            self._mark_cudagraph_steps(transformer)
         compile_args = copy.deepcopy(input_args)
         if not get_runtime_state().has_attention_schedule():
             compile_args["num_inference_steps"] = self._warmup_num_inference_steps
