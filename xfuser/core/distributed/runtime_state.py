@@ -25,6 +25,7 @@ if envs._is_npu():
 
 from xfuser.core.attention import registry as attention_registry
 from xfuser.core.attention.spec import AttentionBackendType
+from xfuser.core.distributed import flydsl_ulysses
 from xfuser.core.distributed.attention_a2a import (
     activate_attention_a2a_backend,
     configure_attention_a2a,
@@ -177,6 +178,7 @@ class RuntimeState(metaclass=ABCMeta):
             )
 
     def destroy_distributed_env(self):
+        flydsl_ulysses.shutdown()
         shutdown_attention_a2a()
         if model_parallel_is_initialized():
             destroy_model_parallel()

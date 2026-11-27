@@ -64,6 +64,11 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     "XDIT_SDMA_LIB": lambda: os.environ.get("XDIT_SDMA_LIB", ""),
     "XDIT_SDMA_WAIT_S": lambda: os.environ.get("XDIT_SDMA_WAIT_S", "30"),
     "XDIT_SDMA_ALLOW_UNTESTED": lambda: os.environ.get("XDIT_SDMA_ALLOW_UNTESTED", "0"),
+    # FlyDSL Ulysses all-to-all (xfuser/core/distributed/flydsl_ulysses.py): 1 moves the bf16 Q/K/V
+    # input exchange from RCCL to AITER's AttentionA2AIntraNodeOp; the inbox memory it writes into:
+    # auto (AITER's policy), uncached (MoRI symmetric heap) or finegrained (HIP IPC).
+    "XDIT_ULYSSES_A2A_FLYDSL": lambda: os.environ.get("XDIT_ULYSSES_A2A_FLYDSL", "0"),
+    "XDIT_FLYDSL_A2A_INBOX": lambda: os.environ.get("XDIT_FLYDSL_A2A_INBOX", "auto"),
 }
 
 

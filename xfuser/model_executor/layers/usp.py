@@ -56,6 +56,7 @@ from xfuser.core.distributed.attention_a2a import (
     use_fused_a2a_output,
     use_fused_a2a_packed,
 )
+from xfuser.core.distributed import flydsl_ulysses
 from xfuser.model_executor.layers import usp_sdma
 from xfuser.model_executor.layers.quantized_attention_output import (
     QuantizedAttentionOutput,
@@ -1077,6 +1078,15 @@ def USP(
             query, key, value = exchanged[:3]
             for (name, _), tensor in zip(extra_inputs, exchanged[3:]):
                 attention_kwargs[name] = tensor
+        elif (
+            not extra_inputs
+            and not joint_strategy
+            and not hb_applied
+            and kv_head_repeat == 1
+            and ring_world_size == 1
+            and flydsl_ulysses.eligible(query, key, value, ulysses_world_size)
+        ):
+            query, key, value = flydsl_ulysses.exchange(query, key, value, PROCESS_GROUP.ULYSSES_PG)
         elif combine_qkv_a2a and query.shape == key.shape == value.shape:
             exchanged = _combined_qkv_all_to_all(query, key, value, *(tensor for _, tensor in extra_inputs))
             query, key, value = exchanged[:3]
