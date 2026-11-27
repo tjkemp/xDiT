@@ -5,9 +5,14 @@ the post-attention output exchange stays on RCCL. The op pushes each rank's head
 straight into its peers' receive buffers ("inboxes") with peer-to-peer stores, so it needs no
 layout copy before the exchange. ``XDIT_FLYDSL_A2A_INBOX`` selects the inbox memory:
 
+- ``finegrained`` (default; also what ``auto`` means here): coherent memory that the L2 may
+  cache. Plain HIP IPC buffers, no MoRI.
 - ``uncached``: bypasses the L2. Lives in the MoRI symmetric heap (needs ``mori.shmem``).
-- ``finegrained``: coherent memory that the L2 may cache. Plain HIP IPC buffers, no MoRI.
-- ``auto`` (default): AITER's policy, uncached at 2 ranks or on xGMI, finegrained otherwise.
+
+On MI350P (PCIe), MiniMax-H3 shape: finegrained is as fast as uncached at 2 ranks and 16x faster
+at 4. Uncached at 2 ranks also made full MiniMax-H3 runs nondeterministic (outputs differed run to
+run, PSNR ~45 dB) although the exchange alone matched RCCL bit for bit over hundreds of trios;
+finegrained runs match RCCL exactly. AITER's own ``auto`` (uncached at 2 ranks) is not used.
 
 The op's outputs are double-buffered and overwritten by peers two trios later, so each
 output is copied into a tensor the caller owns. That copy writes the contiguous BSHD layout
@@ -63,7 +68,7 @@ def eligible(query, key, value, world_size: int) -> bool:
 def _resolved_inbox(setting: str, world_size: int) -> str:
     from aiter.ops.flydsl.comm_collectives_host_shared import resolve_inbox_flags
 
-    return resolve_inbox_flags(setting, world_size)[1]
+    return resolve_inbox_flags("finegrained" if setting == "auto" else setting, world_size)[1]
 
 
 def _ensure_mori_heap(nbytes: int) -> None:
